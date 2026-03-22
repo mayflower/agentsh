@@ -13,6 +13,7 @@ Expansion pipeline:
 from __future__ import annotations
 
 import fnmatch as _fnmatch
+import re as _re
 from typing import TYPE_CHECKING, Protocol
 
 from agentsh.ast.words import (
@@ -22,6 +23,7 @@ from agentsh.ast.words import (
     GlobSegment,
     LiteralSegment,
     ParameterExpansionSegment,
+    ProcessSubstitutionSegment,
     SingleQuotedSegment,
     WordSegment,
 )
@@ -48,6 +50,8 @@ class WordEvaluator:
       - *arith_ev*: the :class:`ArithEvaluator`
       - *cmdsub_hook*: an optional callback for ``$(...)`` expansion
     """
+
+    _procsub_counter: int = 0
 
     def __init__(
         self,
@@ -140,6 +144,9 @@ class WordEvaluator:
             case GlobSegment(pattern=pattern):
                 return [_ExpandedPart(text=pattern, quoted=False, is_glob=True)]
 
+            case ProcessSubstitutionSegment():
+                return [self._expand_process_substitution(seg)]
+
             case _:
                 return [_ExpandedPart(text="", quoted=False)]
 
@@ -176,6 +183,29 @@ class WordEvaluator:
             case _:
                 pass  # fall through to variable lookup
 
+        # Array expansion operators
+        if seg.operator == "[":
+            return self._expand_array_subscript(name, seg.argument or "0")
+        if seg.operator == "#[":
+            # ${#arr[@]} — array length
+            arr = self.state.get_array(name)
+            if arr is not None:
+                return _ExpandedPart(text=str(len(arr)), quoted=False)
+            return _ExpandedPart(text="0", quoted=False)
+        # ${arr[subscript]op...} — array element with further operator
+        if seg.operator and seg.operator.startswith("["):
+            # Parse [subscript]op
+            bracket_end = seg.operator.find("]")
+            if bracket_end >= 0:
+                subscript = seg.operator[1:bracket_end]
+                remaining_op = seg.operator[bracket_end + 1 :]
+                elem_part = self._expand_array_subscript(name, subscript)
+                if remaining_op:
+                    return self._apply_parameter_operator(
+                        name, elem_part.text, remaining_op, seg.argument
+                    )
+                return elem_part
+
         value = self.state.get_var(name)
 
         if seg.operator is None:
@@ -183,7 +213,7 @@ class WordEvaluator:
 
         return self._apply_parameter_operator(name, value, seg.operator, seg.argument)
 
-    def _apply_parameter_operator(
+    def _apply_parameter_operator(  # noqa: C901
         self,
         name: str,
         value: str | None,
@@ -219,6 +249,8 @@ class WordEvaluator:
                     msg = arg or f"{name}: parameter null or not set"
                     raise ValueError(msg)
                 return _ExpandedPart(text=value, quoted=False)
+            case "#len":
+                return _ExpandedPart(text=str(len(value or "")), quoted=False)
             case "#":
                 return self._strip_prefix(value, arg, greedy=False)
             case "##":
@@ -227,6 +259,26 @@ class WordEvaluator:
                 return self._strip_suffix(value, arg, greedy=False)
             case "%%":
                 return self._strip_suffix(value, arg, greedy=True)
+            case "/":
+                return self._pattern_replace(value, arg, replace_all=False)
+            case "//":
+                return self._pattern_replace(value, arg, replace_all=True)
+            case ":":
+                return self._substring(value, arg)
+            case "^":
+                v = value or ""
+                return _ExpandedPart(
+                    text=(v[0].upper() + v[1:] if v else ""), quoted=False
+                )
+            case "^^":
+                return _ExpandedPart(text=(value or "").upper(), quoted=False)
+            case ",":
+                v = value or ""
+                return _ExpandedPart(
+                    text=(v[0].lower() + v[1:] if v else ""), quoted=False
+                )
+            case ",,":
+                return _ExpandedPart(text=(value or "").lower(), quoted=False)
             case _:
                 return _ExpandedPart(text=value or "", quoted=False)
 
@@ -259,6 +311,76 @@ class WordEvaluator:
                 if _fnmatch.fnmatch(value[i:], pattern):
                     return _ExpandedPart(text=value[:i], quoted=False)
         return _ExpandedPart(text=value, quoted=False)
+
+    def _pattern_replace(
+        self, value: str | None, arg: str, *, replace_all: bool
+    ) -> _ExpandedPart:
+        """${var/pattern/replacement} and ${var//pattern/replacement}."""
+        v = value or ""
+        if "/" in arg:
+            pattern, replacement = arg.split("/", 1)
+        else:
+            pattern, replacement = arg, ""
+        regex = _glob_to_regex(pattern)
+        if replace_all:
+            result = _re.sub(regex, replacement, v)
+        else:
+            result = _re.sub(regex, replacement, v, count=1)
+        return _ExpandedPart(text=result, quoted=False)
+
+    def _substring(self, value: str | None, arg: str) -> _ExpandedPart:
+        """${var:offset} and ${var:offset:length}."""
+        v = value or ""
+        parts = arg.split(":")
+        try:
+            offset = int(parts[0].strip())
+        except ValueError:
+            return _ExpandedPart(text=v, quoted=False)
+        if offset < 0:
+            offset = max(0, len(v) + offset)
+        if len(parts) > 1:
+            try:
+                length = int(parts[1].strip())
+            except ValueError:
+                return _ExpandedPart(text=v[offset:], quoted=False)
+            return _ExpandedPart(text=v[offset : offset + length], quoted=False)
+        return _ExpandedPart(text=v[offset:], quoted=False)
+
+    def _expand_process_substitution(
+        self, seg: ProcessSubstitutionSegment
+    ) -> _ExpandedPart:
+        """Expand a process substitution via command execution."""
+        WordEvaluator._procsub_counter += 1
+        path = f"/dev/fd/procsub_{WordEvaluator._procsub_counter}"
+        if self.cmdsub_hook is not None:
+            output = self.cmdsub_hook(seg.command)
+            self.vfs.write(path, output.encode("utf-8"))
+        else:
+            self.vfs.write(path, b"")
+        return _ExpandedPart(text=path, quoted=False)
+
+    def _expand_array_subscript(self, name: str, subscript: str) -> _ExpandedPart:
+        """Expand ${arr[subscript]}."""
+        arr = self.state.get_array(name)
+        if subscript in ("@", "*"):
+            if arr is not None:
+                return _ExpandedPart(text=" ".join(arr), quoted=False)
+            # Fall back to scalar
+            val = self.state.get_var(name) or ""
+            return _ExpandedPart(text=val, quoted=False)
+        # Numeric index
+        try:
+            idx = int(subscript)
+        except ValueError:
+            # Try arithmetic evaluation
+            idx = self.arith_ev.eval_expr(subscript)
+        if arr is not None and 0 <= idx < len(arr):
+            return _ExpandedPart(text=arr[idx], quoted=False)
+        # Fall back to scalar for index 0
+        if idx == 0:
+            val = self.state.get_var(name) or ""
+            return _ExpandedPart(text=val, quoted=False)
+        return _ExpandedPart(text="", quoted=False)
 
     # ------------------------------------------------------------------
     # Helper: expand $VAR inside parameter-expansion arguments
@@ -390,4 +512,32 @@ def _split_on_ifs(text: str, ifs: str) -> list[str]:
         else:
             current += char
     result.append(current)
+    return result
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """Convert a shell glob pattern to a Python regex string."""
+    result = ""
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            result += ".*"
+        elif c == "?":
+            result += "."
+        elif c == "[":
+            j = i + 1
+            if j < len(pattern) and pattern[j] == "!":
+                result += "[^"
+                j += 1
+            else:
+                result += "["
+            while j < len(pattern) and pattern[j] != "]":
+                result += _re.escape(pattern[j])
+                j += 1
+            result += "]"
+            i = j
+        else:
+            result += _re.escape(c)
+        i += 1
     return result

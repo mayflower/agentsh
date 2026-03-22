@@ -17,8 +17,11 @@ from typing import TYPE_CHECKING
 
 from agentsh.ast.nodes import (
     AndOrList,
+    ArrayAssignmentWord,
     ASTNode,
     CaseClause,
+    CStyleForLoop,
+    ExtendedTest,
     ForLoop,
     FunctionDef,
     Group,
@@ -87,7 +90,7 @@ class CommandEvaluator:
     # Main dispatch
     # ------------------------------------------------------------------
 
-    def execute_node(self, node: ASTNode, io: IOContext | None = None) -> CommandResult:
+    def execute_node(self, node: ASTNode, io: IOContext | None = None) -> CommandResult:  # noqa: C901
         """Execute an AST node and return the result."""
         if io is None:
             io = IOContext()
@@ -117,8 +120,12 @@ class CommandEvaluator:
                 return self._execute_until(node, io)
             case ForLoop():
                 return self._execute_for(node, io)
+            case CStyleForLoop():
+                return self._execute_c_style_for(node, io)
             case CaseClause():
                 return self._execute_case(node, io)
+            case ExtendedTest():
+                return self._execute_extended_test(node, io)
             case _:
                 io.stderr.write(
                     f"agentsh: unsupported node type: {type(node).__name__}\n"
@@ -185,6 +192,27 @@ class CommandEvaluator:
         # Handle prefix assignments
         saved_vars: dict[str, str | None] = {}
         for assign in node.assignments:
+            if isinstance(assign, ArrayAssignmentWord):
+                values: list[str] = []
+                for val_word in assign.values:
+                    values.extend(self.word_ev.eval_word(val_word))
+                self.state.set_array(assign.name, values)
+                continue
+            # Check for subscript assignment: name[idx]=value
+            aname = assign.name
+            if "[" in aname and aname.endswith("]"):
+                bracket = aname.index("[")
+                base = aname[:bracket]
+                idx_str = aname[bracket + 1 : -1]
+                try:
+                    idx = int(idx_str)
+                except ValueError:
+                    idx = self.arith_ev.eval_expr(idx_str)
+                value = ""
+                if assign.value is not None:
+                    value = self.word_ev.eval_word_single(assign.value)
+                self.state.set_array_element(base, idx, value)
+                continue
             value = ""
             if assign.value is not None:
                 value = self.word_ev.eval_word_single(assign.value)
@@ -359,6 +387,49 @@ class CommandEvaluator:
                     return CommandResult(exit_code=0)
 
         return CommandResult(exit_code=0)
+
+    def _execute_extended_test(
+        self, node: ExtendedTest, io: IOContext
+    ) -> CommandResult:
+        """Execute [[ ... ]] extended test."""
+        # Expand words (skip [[ and ]])
+        tokens: list[str] = []
+        for word in node.words:
+            expanded = self.word_ev.eval_word(word)
+            tokens.extend(expanded)
+        # Strip [[ and ]]
+        if tokens and tokens[0] == "[[":
+            tokens = tokens[1:]
+        if tokens and tokens[-1] == "]]":
+            tokens = tokens[:-1]
+        result = self.bool_ev.eval_extended_test(tokens)
+        exit_code = 0 if result else 1
+        self.state.last_status = exit_code
+        return CommandResult(exit_code=exit_code)
+
+    def _execute_c_style_for(self, node: CStyleForLoop, io: IOContext) -> CommandResult:
+        """Execute a C-style for loop: for (( init; cond; update ))."""
+        result = CommandResult(exit_code=0)
+        # Execute init
+        if node.init:
+            self.arith_ev.eval_statement(node.init)
+        iterations = 0
+        max_iter = self.policy.config.max_recursion_depth * 10
+        while True:
+            # Evaluate condition (empty condition = true)
+            if node.condition:
+                cond_val = self.arith_ev.eval_expr(node.condition)
+                if cond_val == 0:
+                    break
+            result = self.execute_node(node.body, io)
+            iterations += 1
+            if iterations > max_iter:
+                io.stderr.write("agentsh: C-style for loop iteration limit reached\n")
+                break
+            # Evaluate update
+            if node.update:
+                self.arith_ev.eval_statement(node.update)
+        return result
 
     # ------------------------------------------------------------------
     # Command substitution hook

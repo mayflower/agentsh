@@ -97,6 +97,14 @@ class GlobSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessSubstitutionSegment:
+    """A process substitution — ``<(command)`` or ``>(command)``."""
+
+    command: str
+    direction: str  # "<" or ">"
+
+
+@dataclass(frozen=True, slots=True)
 class DoubleQuotedSegment:
     """A double-quoted string — may contain nested expansions.
 
@@ -125,6 +133,7 @@ WordSegment = (
     | CommandSubstitutionSegment
     | ArithmeticExpansionSegment
     | GlobSegment
+    | ProcessSubstitutionSegment
 )
 
 # Update the forward reference now that WordSegment is defined.

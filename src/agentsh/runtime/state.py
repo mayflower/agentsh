@@ -29,12 +29,18 @@ class Scope:
     exists in an ancestor (matching Bash's dynamic-scope semantics).
     """
 
-    __slots__ = ("bindings", "parent")
+    __slots__ = ("array_bindings", "bindings", "parent")
 
     def __init__(
-        self, parent: Scope | None = None, bindings: dict[str, str] | None = None
+        self,
+        parent: Scope | None = None,
+        bindings: dict[str, str] | None = None,
+        array_bindings: dict[str, list[str]] | None = None,
     ) -> None:
         self.bindings: dict[str, str] = bindings if bindings is not None else {}
+        self.array_bindings: dict[str, list[str]] = (
+            array_bindings if array_bindings is not None else {}
+        )
         self.parent = parent
 
     # -- lookup ---------------------------------------------------------------
@@ -77,6 +83,56 @@ class Scope:
                 return
             scope = scope.parent
 
+    # -- array operations -----------------------------------------------------
+
+    def get_array(self, name: str) -> list[str] | None:
+        """Walk the scope chain looking for array *name*."""
+        scope: Scope | None = self
+        while scope is not None:
+            if name in scope.array_bindings:
+                return scope.array_bindings[name]
+            scope = scope.parent
+        return None
+
+    def set_array(self, name: str, values: list[str]) -> None:
+        """Set array *name* in the nearest scope that already owns it, or in *self*."""
+        scope: Scope | None = self
+        while scope is not None:
+            if name in scope.array_bindings:
+                scope.array_bindings[name] = values
+                return
+            scope = scope.parent
+        self.array_bindings[name] = values
+
+    def get_array_element(self, name: str, index: int) -> str | None:
+        """Get a single element from array *name*."""
+        arr = self.get_array(name)
+        if arr is not None and 0 <= index < len(arr):
+            return arr[index]
+        return None
+
+    def set_array_element(self, name: str, index: int, value: str) -> None:
+        """Set a single element of array *name*, extending if needed."""
+        arr = self.get_array(name)
+        if arr is None:
+            arr = []
+            self.array_bindings[name] = arr
+        while len(arr) <= index:
+            arr.append("")
+        arr[index] = value
+
+    def flatten_arrays(self) -> dict[str, list[str]]:
+        """Collapse the chain into a single dict of arrays."""
+        result: dict[str, list[str]] = {}
+        frames: list[Scope] = []
+        scope: Scope | None = self
+        while scope is not None:
+            frames.append(scope)
+            scope = scope.parent
+        for frame in reversed(frames):
+            result.update(frame.array_bindings)
+        return result
+
     # -- child scope ----------------------------------------------------------
 
     def push(self, bindings: dict[str, str] | None = None) -> Scope:
@@ -99,7 +155,11 @@ class Scope:
 
     def snapshot(self) -> Scope:
         """Return a *detached* copy (for subshell isolation)."""
-        return Scope(parent=None, bindings=dict(self.flatten()))
+        return Scope(
+            parent=None,
+            bindings=dict(self.flatten()),
+            array_bindings={k: list(v) for k, v in self.flatten_arrays().items()},
+        )
 
 
 @dataclass
@@ -148,6 +208,24 @@ class ShellState:
             self.scope.set(name, value)
         val = self.scope.get(name) or ""
         self.exported_env[name] = val
+
+    # -- array access (delegates to scope chain) ------------------------------
+
+    def get_array(self, name: str) -> list[str] | None:
+        """Look up array variable in scope chain."""
+        return self.scope.get_array(name)
+
+    def set_array(self, name: str, values: list[str]) -> None:
+        """Set an array variable."""
+        self.scope.set_array(name, values)
+
+    def get_array_element(self, name: str, index: int) -> str | None:
+        """Get a single element from an array."""
+        return self.scope.get_array_element(name, index)
+
+    def set_array_element(self, name: str, index: int, value: str) -> None:
+        """Set a single element of an array."""
+        self.scope.set_array_element(name, index, value)
 
     # -- scope management -----------------------------------------------------
 

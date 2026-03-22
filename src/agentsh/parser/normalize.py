@@ -13,9 +13,12 @@ from tree_sitter import Node
 
 from agentsh.ast.nodes import (
     AndOrList,
+    ArrayAssignmentWord,
     AssignmentWord,
     CaseClause,
     CaseItem,
+    CStyleForLoop,
+    ExtendedTest,
     ForLoop,
     FunctionDef,
     Group,
@@ -37,6 +40,7 @@ from agentsh.ast.words import (
     GlobSegment,
     LiteralSegment,
     ParameterExpansionSegment,
+    ProcessSubstitutionSegment,
     SingleQuotedSegment,
     WordSegment,
 )
@@ -182,7 +186,7 @@ def _normalize_ts_command(
 ) -> SimpleCommand:
     """Normalize a tree-sitter 'command' node (with command_name) into SimpleCommand."""
     words: list[Word] = []
-    assignments: list[AssignmentWord] = []
+    assignments: list[AssignmentWord | ArrayAssignmentWord] = []
     redirections: list[Redirection] = []
 
     for child in node.children:
@@ -193,7 +197,7 @@ def _normalize_ts_command(
             words.append(_normalize_word_node(child, source))
         elif child.type == "variable_assignment":
             assignments.append(_normalize_assignment(child, source, diagnostics))
-        elif child.type in ("file_redirect", "heredoc_redirect"):
+        elif child.type in ("file_redirect", "heredoc_redirect", "herestring_redirect"):
             redirections.append(_normalize_redirection(child, source, diagnostics))
         elif child.type in (
             "word",
@@ -221,7 +225,7 @@ def _normalize_simple_command(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> SimpleCommand:
     words: list[Word] = []
-    assignments: list[AssignmentWord] = []
+    assignments: list[AssignmentWord | ArrayAssignmentWord] = []
     redirections: list[Redirection] = []
 
     for child in node.children:
@@ -229,7 +233,7 @@ def _normalize_simple_command(
             continue
         if child.type == "variable_assignment":
             assignments.append(_normalize_assignment(child, source, diagnostics))
-        elif child.type in {"file_redirect", "heredoc_redirect"}:
+        elif child.type in {"file_redirect", "heredoc_redirect", "herestring_redirect"}:
             redirections.append(_normalize_redirection(child, source, diagnostics))
         elif child.type in (
             "word",
@@ -256,29 +260,121 @@ def _normalize_simple_command(
 
 def _normalize_assignment(
     node: Node, source: str, diagnostics: list[Diagnostic]
-) -> AssignmentWord:
+) -> AssignmentWord | ArrayAssignmentWord:
     name_node = node.child_by_field_name("name")
     value_node = node.child_by_field_name("value")
 
     name = _node_text(name_node, source) if name_node else ""
+
+    # Check for array assignment: name=(val1 val2 ...)
+    for child in node.children:
+        if child.type == "array":
+            values: list[Word] = []
+            for elem in child.children:
+                if elem.is_named:
+                    values.append(_normalize_word_node(elem, source))
+            return ArrayAssignmentWord(
+                name=name, values=tuple(values), span=_span(node)
+            )
+
+    # Handle subscript assignment: name[idx]=value
+    if name_node and "[" in _node_text(name_node, source):
+        raw_name = _node_text(name_node, source)
+        # Keep full name[idx] as the name for the executor to parse
+        name = raw_name
+
     value = _normalize_word_node(value_node, source) if value_node else None
 
     return AssignmentWord(name=name, value=value, span=_span(node))
 
 
-def _normalize_redirection(
+def _normalize_redirection(  # noqa: C901
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> Redirection:
     fd: int | None = None
     op = ""
     target_word: Word | None = None
 
+    # --- here-string (<<<) ---
+    if node.type == "herestring_redirect":
+        op = "<<<"
+        for child in node.children:
+            if child.type == "file_descriptor":
+                fd = int(_node_text(child, source))
+            elif child.is_named and child.type != "file_descriptor":
+                target_word = _normalize_word_node(child, source)
+        if target_word is None:
+            full = _node_text(node, source)
+            idx = full.find("<<<")
+            body = full[idx + 3 :].strip() if idx >= 0 else ""
+            target_word = Word(segments=(LiteralSegment(value=body),), span=_span(node))
+        return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
+
+    # --- here-doc (<<, <<-) ---
+    if node.type == "heredoc_redirect":
+        op = "<<"
+        # Detect <<- (tab-stripping variant)
+        strip_tabs = False
+        for child in node.children:
+            if not child.is_named:
+                text = _node_text(child, source)
+                if text == "<<-":
+                    strip_tabs = True
+                    op = "<<"
+                elif text == "<<":
+                    op = "<<"
+
+        # Find the heredoc body node
+        body_node = None
+        delimiter_node = None
+        for child in node.children:
+            if child.type == "heredoc_body":
+                body_node = child
+            elif child.is_named and child.type not in (
+                "heredoc_body",
+                "file_descriptor",
+            ):
+                delimiter_node = child
+
+        # Determine if delimiter was quoted (suppresses expansion)
+        quoted_delimiter = False
+        if delimiter_node:
+            dtxt = _node_text(delimiter_node, source)
+            if dtxt.startswith("'") or dtxt.startswith('"') or "\\" in dtxt:
+                quoted_delimiter = True
+
+        if body_node:
+            body_text = _node_text(body_node, source)
+            # Remove the trailing delimiter line
+            lines = body_text.split("\n")
+            if lines and lines[-1].strip() == "":
+                lines = lines[:-1]
+            # Strip tabs for <<-
+            if strip_tabs:
+                lines = [line.lstrip("\t") for line in lines]
+            body_text = "\n".join(lines)
+            if body_text and not body_text.endswith("\n"):
+                body_text += "\n"
+        else:
+            body_text = ""
+
+        if quoted_delimiter:
+            target_word = Word(
+                segments=(SingleQuotedSegment(value=body_text),), span=_span(node)
+            )
+        else:
+            target_word = Word(
+                segments=(LiteralSegment(value=body_text),), span=_span(node)
+            )
+        return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
+
+    # --- normal file redirections ---
     for child in node.children:
         if child.type == "file_descriptor":
             fd = int(_node_text(child, source))
         elif not child.is_named:
             text = _node_text(child, source)
-            if text in (">", ">>", "<", "<<", ">&", "<&", "2>", "2>>"):
+            if text in (">", ">>", "<", "<<", "<<<", ">&", "<&", "2>", "2>>"):
                 op = text
         else:
             target_word = _normalize_word_node(child, source)
@@ -286,7 +382,7 @@ def _normalize_redirection(
     if not op:
         # Infer from the full text
         full = _node_text(node, source)
-        for candidate in (">>", ">", "<<", "<", ">&", "<&"):
+        for candidate in (">>>", ">>", ">", "<<<", "<<", "<", ">&", "<&"):
             if candidate in full:
                 op = candidate
                 break
@@ -468,7 +564,7 @@ def _normalize_variable_assignments(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> SimpleCommand:
     """Normalize multiple variable assignments (FOO=bar BAR=baz)."""
-    assignments: list[AssignmentWord] = []
+    assignments: list[AssignmentWord | ArrayAssignmentWord] = []
     for child in node.children:
         if child.is_named and child.type == "variable_assignment":
             assignments.append(_normalize_assignment(child, source, diagnostics))
@@ -580,7 +676,8 @@ def _normalize_redirected_statement(
     redirect_nodes = [
         c
         for c in node.children
-        if c.is_named and c.type in ("file_redirect", "heredoc_redirect")
+        if c.is_named
+        and c.type in ("file_redirect", "heredoc_redirect", "herestring_redirect")
     ]
 
     if body_node is not None:
@@ -669,6 +766,14 @@ def _extract_segments(node: Node, source: str) -> list[WordSegment]:  # noqa: C9
         text = _node_text(node, source)
         expr = text[3:-2] if text.startswith("$((") and text.endswith("))") else text
         return [ArithmeticExpansionSegment(expression=expr)]
+
+    if ntype == "process_substitution":
+        text = _node_text(node, source)
+        if text.startswith("<(") and text.endswith(")"):
+            return [ProcessSubstitutionSegment(command=text[2:-1], direction="<")]
+        if text.startswith(">(") and text.endswith(")"):
+            return [ProcessSubstitutionSegment(command=text[2:-1], direction=">")]
+        return [LiteralSegment(value=text)]
 
     if ntype == "concatenation":
         segments: list[WordSegment] = []
@@ -782,8 +887,106 @@ def _parse_expansion(node: Node, source: str) -> ParameterExpansionSegment:
     else:
         inner = text.lstrip(" $")
 
-    # Check for operators: :-, :+, :=, :?, -, +, =, ?
-    for op in (":-", ":+", ":=", ":?", "-", "+", "=", "?", "##", "#", "%%", "%"):
+    # ${#var} — string length operator
+    if inner.startswith("#") and not inner.startswith("##"):
+        rest = inner[1:]
+        # ${#arr[@]} or ${#arr[*]} — array length
+        if "[" in rest:
+            arr_name = rest[: rest.index("[")]
+            return ParameterExpansionSegment(
+                name=arr_name, operator="#[", argument=None
+            )
+        return ParameterExpansionSegment(name=rest, operator="#len", argument=None)
+
+    # ${arr[idx]} — array subscript (possibly with further operator)
+    if "[" in inner:
+        bracket_start = inner.index("[")
+        name = inner[:bracket_start]
+        rest = inner[bracket_start:]
+        # Find the closing ]
+        bracket_end = rest.find("]")
+        if bracket_end >= 0:
+            subscript = rest[1:bracket_end]
+            after = rest[bracket_end + 1 :]
+            if not after:
+                # Plain ${arr[idx]}
+                return ParameterExpansionSegment(
+                    name=name, operator="[", argument=subscript
+                )
+            # ${arr[idx]op...} e.g. ${arr[0]:-default}
+            for op in (
+                ":-",
+                ":+",
+                ":=",
+                ":?",
+                "-",
+                "+",
+                "=",
+                "?",
+                "//",
+                "/",
+                "##",
+                "#",
+                "%%",
+                "%",
+                "^^",
+                "^",
+                ",,",
+                ",",
+                ":",
+            ):
+                if after.startswith(op):
+                    arg = after[len(op) :]
+                    return ParameterExpansionSegment(
+                        name=name,
+                        operator=f"[{subscript}]{op}",
+                        argument=arg,
+                    )
+            return ParameterExpansionSegment(
+                name=name, operator="[", argument=subscript
+            )
+
+    # ${var:offset:length} — substring extraction
+    # Must check before the regular operator scan to avoid confusion with :- etc.
+    colon_idx = inner.find(":")
+    if colon_idx > 0:
+        after_colon = inner[colon_idx + 1 :]
+        # Substring if what follows the colon looks numeric (possibly negative)
+        if (
+            after_colon
+            and (
+                after_colon[0].isdigit()
+                or after_colon[0] == "-"
+                or after_colon[0] == " "
+            )
+            and not after_colon.startswith(("-", "+", "=", "?"))
+        ):
+            name = inner[:colon_idx]
+            return ParameterExpansionSegment(
+                name=name, operator=":", argument=after_colon
+            )
+
+    # Check for operators: :-, :+, :=, :?, -, +, =, ?, //, /, ##, #, %%, %, ^^, ^, ,,, ,
+    for op in (
+        ":-",
+        ":+",
+        ":=",
+        ":?",
+        "-",
+        "+",
+        "=",
+        "?",
+        "//",
+        "/",
+        "##",
+        "#",
+        "%%",
+        "%",
+        "^^",
+        "^",
+        ",,",
+        ",",
+    ):
         idx = inner.find(op)
         if idx > 0:
             name = inner[:idx]
@@ -1037,6 +1240,37 @@ def _extract_loop_condition_body(
     return condition, body
 
 
+def _normalize_c_style_for(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> CStyleForLoop:
+    """Normalize a C-style for loop: for (( init; cond; update )); do body; done."""
+    text = _node_text(node, source)
+    # Extract the (( ... )) part
+    paren_start = text.find("((")
+    paren_end = text.find("))")
+    if paren_start >= 0 and paren_end > paren_start:
+        inner = text[paren_start + 2 : paren_end].strip()
+        parts = inner.split(";")
+        init = parts[0].strip() if len(parts) > 0 else ""
+        condition = parts[1].strip() if len(parts) > 1 else ""
+        update = parts[2].strip() if len(parts) > 2 else ""
+    else:
+        init, condition, update = "", "", ""
+
+    body: ASTNode = Sequence(commands=(), span=_span(node))
+    body_node = node.child_by_field_name("body")
+    if body_node:
+        body_children = _normalize_children(body_node, source, diagnostics)
+        if len(body_children) == 1:
+            body = body_children[0]
+        elif body_children:
+            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+
+    return CStyleForLoop(
+        init=init, condition=condition, update=update, body=body, span=_span(node)
+    )
+
+
 def _normalize_case_statement(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> CaseClause:
@@ -1092,9 +1326,16 @@ def _normalize_case_statement(
 # Node type -> handler mapping
 def _normalize_test_command(
     node: Node, source: str, diagnostics: list[Diagnostic]
-) -> SimpleCommand:
-    """Normalize a test_command ([ ... ] or test ...) into SimpleCommand."""
-    words: list[Word] = []
+) -> SimpleCommand | ExtendedTest:
+    """Normalize a test_command ([ ... ], test ..., or [[ ... ]]) into AST."""
+    # Detect [[ ... ]] extended test
+    text = _node_text(node, source)
+    if text.startswith("[["):
+        words: list[Word] = []
+        _flatten_extended_test_children(node, source, words)
+        return ExtendedTest(words=tuple(words), span=_span(node))
+
+    words = []
     _flatten_test_children(node, source, words)
     return SimpleCommand(
         words=tuple(words),
@@ -1110,7 +1351,7 @@ def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
         ctype = child.type
         text = _node_text(child, source)
 
-        if ctype in ("[", "]") or ctype == "test_operator":
+        if ctype in ("[", "]", "[[", "]]") or ctype == "test_operator":
             words.append(
                 Word(
                     segments=(LiteralSegment(value=text),),
@@ -1119,7 +1360,7 @@ def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
             )
         elif ctype in ("unary_expression", "binary_expression"):
             _flatten_test_children(child, source, words)
-        elif ctype == "number":
+        elif ctype in ("number", "regex"):
             words.append(
                 Word(
                     segments=(LiteralSegment(value=text),),
@@ -1129,6 +1370,44 @@ def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
         elif child.is_named:
             words.append(_normalize_word_node(child, source))
         elif text not in ("", " ", "(", ")"):
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+
+
+def _flatten_extended_test_children(node: Node, source: str, words: list[Word]) -> None:
+    """Recursively flatten [[ ... ]] children into a word list, preserving ( and )."""
+    for child in node.children:
+        ctype = child.type
+        text = _node_text(child, source)
+
+        if ctype in ("[[", "]]") or ctype == "test_operator":
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+        elif ctype in (
+            "unary_expression",
+            "binary_expression",
+            "parenthesized_expression",
+        ):
+            _flatten_extended_test_children(child, source, words)
+        elif ctype in ("number", "regex"):
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+        elif child.is_named:
+            words.append(_normalize_word_node(child, source))
+        elif text not in ("", " "):
+            # Include ( and ) for grouping in [[ ]]
             words.append(
                 Word(
                     segments=(LiteralSegment(value=text),),
@@ -1156,6 +1435,7 @@ _NODE_HANDLERS: dict[str, Callable[..., Any]] = {
     "for_statement": _normalize_for_statement,
     "while_statement": _normalize_while_statement,
     "until_statement": _normalize_until_statement,
+    "c_style_for_statement": _normalize_c_style_for,
     "case_statement": _normalize_case_statement,
     "test_command": _normalize_test_command,
     "do_group": _normalize_list,

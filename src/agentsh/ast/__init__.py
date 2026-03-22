@@ -8,10 +8,13 @@ Public API re-exports:
 
 from agentsh.ast.nodes import (
     AndOrList,
+    ArrayAssignmentWord,
     AssignmentWord,
     ASTNode,
     CaseClause,
     CaseItem,
+    CStyleForLoop,
+    ExtendedTest,
     ForLoop,
     FunctionDef,
     Group,
@@ -34,21 +37,23 @@ from agentsh.ast.words import (
     GlobSegment,
     LiteralSegment,
     ParameterExpansionSegment,
+    ProcessSubstitutionSegment,
     SingleQuotedSegment,
     WordSegment,
 )
 
 __all__ = [
-    # nodes
     "ASTNode",
     "AndOrList",
-    # word segments
     "ArithmeticExpansionSegment",
+    "ArrayAssignmentWord",
     "AssignmentWord",
+    "CStyleForLoop",
     "CaseClause",
     "CaseItem",
     "CommandSubstitutionSegment",
     "DoubleQuotedSegment",
+    "ExtendedTest",
     "ForLoop",
     "FunctionDef",
     "GlobSegment",
@@ -57,8 +62,8 @@ __all__ = [
     "LiteralSegment",
     "ParameterExpansionSegment",
     "Pipeline",
-    # spans
     "Point",
+    "ProcessSubstitutionSegment",
     "Program",
     "Redirection",
     "Sequence",

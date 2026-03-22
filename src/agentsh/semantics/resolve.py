@@ -33,6 +33,7 @@ _SHELL_BUILTINS: frozenset[str] = frozenset(
         "false",
         "test",
         "[",
+        "[[",
         "exit",
         "source",
         ".",

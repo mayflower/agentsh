@@ -50,7 +50,13 @@ def apply_redirections(  # noqa: C901
         fd = redir.fd
         abs_path = vfs.resolve(target_path, state.cwd)
 
-        if op == "<":
+        if op == "<<":
+            # Here-doc: target word contains the document body
+            io_ctx.stdin = StringIO(target_path)
+        elif op == "<<<":
+            # Here-string: target word is the string
+            io_ctx.stdin = StringIO(target_path + "\n")
+        elif op == "<":
             try:
                 data = vfs.read(abs_path)
                 io_ctx.stdin = StringIO(data.decode("utf-8", errors="replace"))

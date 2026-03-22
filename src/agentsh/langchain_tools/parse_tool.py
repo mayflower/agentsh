@@ -36,6 +36,19 @@ class AgentShParseTool(BaseTool):
         return json.dumps(output, indent=2)
 
 
+def _assignment_to_dict(a: Any) -> dict[str, Any]:
+    """Convert an assignment node to a dict."""
+    from agentsh.ast.nodes import ArrayAssignmentWord
+
+    if isinstance(a, ArrayAssignmentWord):
+        return {
+            "type": "array_assignment",
+            "name": a.name,
+            "values": [_word_to_dict(v) for v in a.values],
+        }
+    return {"name": a.name, "value": _word_to_dict(a.value) if a.value else None}
+
+
 def ast_to_dict(node: Any) -> dict[str, Any]:
     """Convert an AST node to a JSON-serializable dict."""
     from agentsh.ast.nodes import (
@@ -75,10 +88,7 @@ def ast_to_dict(node: Any) -> dict[str, Any]:
         return {
             "type": "SimpleCommand",
             "words": [_word_to_dict(w) for w in node.words],
-            "assignments": [
-                {"name": a.name, "value": _word_to_dict(a.value) if a.value else None}
-                for a in node.assignments
-            ],
+            "assignments": [_assignment_to_dict(a) for a in node.assignments],
         }
     if isinstance(node, Group):
         return {"type": "Group", "body": ast_to_dict(node.body)}

@@ -63,6 +63,15 @@ class AssignmentWord:
 
 
 @dataclass(frozen=True, slots=True)
+class ArrayAssignmentWord:
+    """An array assignment: ``name=(value1 value2 ...)``."""
+
+    name: str
+    values: tuple[Word, ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
 class Redirection:
     """An I/O redirection attached to a command.
 
@@ -93,7 +102,7 @@ class SimpleCommand:
     """
 
     words: tuple[Word, ...]
-    assignments: tuple[AssignmentWord, ...]
+    assignments: tuple[AssignmentWord | ArrayAssignmentWord, ...]
     redirections: tuple[Redirection, ...]
     span: Span
 
@@ -227,6 +236,25 @@ class ForLoop:
 
     variable: str
     words: tuple[Word, ...] | None
+    body: ASTNode
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class ExtendedTest:
+    """An extended test command: ``[[ expression ]]``."""
+
+    words: tuple[Word, ...]
+    span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class CStyleForLoop:
+    """A C-style for loop: ``for (( init; condition; update )); do body; done``."""
+
+    init: str
+    condition: str
+    update: str
     body: ASTNode
     span: Span
 

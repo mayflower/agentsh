@@ -117,6 +117,19 @@ class Planner:
     def _plan_simple_command(self, node: SimpleCommand, plan: ExecutionPlan) -> None:  # noqa: C901
         # Plan assignments
         for assign in node.assignments:
+            from agentsh.ast.nodes import ArrayAssignmentWord
+
+            if isinstance(assign, ArrayAssignmentWord):
+                plan.effects.append(
+                    PlannedEffect(
+                        kind="state_change",
+                        description=f"Set array: {assign.name}=(...)",
+                        target=assign.name,
+                        details={"value": "<array>"},
+                    )
+                )
+                continue
+
             value_text = "<unknown>"
             if assign.value is not None:
                 # Try to extract literal value
