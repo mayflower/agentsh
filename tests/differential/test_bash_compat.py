@@ -667,7 +667,5 @@ def test_compatibility_report(tmp_path: Path) -> None:
         "results": results,
     }
 
-    report_path = Path(
-        "/Users/johann/src/ml/justbashpy/status/compatibility_report.json"
-    )
+    report_path = tmp_path / "compatibility_report.json"
     report_path.write_text(json.dumps(report, indent=2))
