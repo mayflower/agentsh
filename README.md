@@ -1,5 +1,13 @@
 # agentsh
 
+[![CI](https://github.com/mayflower/agentsh/actions/workflows/ci.yml/badge.svg)](https://github.com/mayflower/agentsh/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/agentsh)](https://pypi.org/project/agentsh/)
+[![Python](https://img.shields.io/pypi/pyversions/agentsh)](https://pypi.org/project/agentsh/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+[![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
+
 A virtual Bash environment for AI agents. Pure Python, pure in-memory — no subprocess, no real filesystem, no VM.
 
 ```python
