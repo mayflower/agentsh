@@ -9,13 +9,16 @@ from agentsh.commands import (  # noqa: F401
     fileio,
     fileops,
     math_cmd,
+    modern_search,
     pathutil,
     search,
     stream,
+    structured,
     sysinfo,
     sysutil,
     textproc,
     textproc2,
+    trivial,
 )
 from agentsh.commands._registry import COMMANDS
 
