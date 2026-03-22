@@ -1,0 +1,1168 @@
+"""CST to AST normalization pass.
+
+Converts tree-sitter CST nodes into project-owned AST nodes.
+Unsupported syntax raises explicit diagnostics.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from tree_sitter import Node
+
+from agentsh.ast.nodes import (
+    AndOrList,
+    AssignmentWord,
+    CaseClause,
+    CaseItem,
+    ForLoop,
+    FunctionDef,
+    Group,
+    IfClause,
+    Pipeline,
+    Program,
+    Redirection,
+    Sequence,
+    SimpleCommand,
+    Subshell,
+    UntilLoop,
+    WhileLoop,
+    Word,
+)
+from agentsh.ast.spans import Point, Span
+from agentsh.ast.words import (
+    ArithmeticExpansionSegment,
+    CommandSubstitutionSegment,
+    GlobSegment,
+    LiteralSegment,
+    ParameterExpansionSegment,
+    SingleQuotedSegment,
+    WordSegment,
+)
+from agentsh.parser.diagnostics import (
+    Diagnostic,
+    DiagnosticSeverity,
+    UnsupportedSyntaxError,
+)
+
+# AST node type
+ASTNode = (
+    Program
+    | Sequence
+    | AndOrList
+    | Pipeline
+    | SimpleCommand
+    | Group
+    | Subshell
+    | FunctionDef
+)
+
+
+def _span(node: Node) -> Span:
+    return Span(
+        start_byte=node.start_byte,
+        end_byte=node.end_byte,
+        start_point=Point(row=node.start_point[0], column=node.start_point[1]),
+        end_point=Point(row=node.end_point[0], column=node.end_point[1]),
+    )
+
+
+def _node_text(node: Node, source: str) -> str:
+    return source[node.start_byte : node.end_byte]
+
+
+def _named_children(node: Node) -> list[Node]:
+    return [c for c in node.children if c.is_named]
+
+
+def normalize(root: Node, source: str) -> tuple[Program, list[Diagnostic]]:
+    """Normalize a tree-sitter CST root into a project-owned AST Program."""
+    diagnostics: list[Diagnostic] = []
+    body = _normalize_children(root, source, diagnostics)
+    return Program(body=tuple(body), span=_span(root)), diagnostics
+
+
+def _normalize_children(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> list[ASTNode]:
+    results: list[ASTNode] = []
+    for child in node.children:
+        if not child.is_named:
+            continue
+        if child.type == "ERROR":
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.ERROR,
+                    message=f"Syntax error: {_node_text(child, source)!r}",
+                    span=_span(child),
+                )
+            )
+            continue
+        try:
+            ast_node = _normalize_node(child, source, diagnostics)
+            if ast_node is not None:
+                results.append(ast_node)
+        except UnsupportedSyntaxError as e:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    message=f"Unsupported syntax: {e}",
+                    span=_span(child),
+                )
+            )
+    return results
+
+
+def _normalize_node(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> ASTNode | None:
+    handler = _NODE_HANDLERS.get(node.type)
+    if handler is not None:
+        return handler(node, source, diagnostics)
+
+    # Treat unknown named nodes as unsupported
+    if node.type in _IGNORED_TYPES:
+        return None
+
+    raise UnsupportedSyntaxError(
+        f"Node type '{node.type}' is not supported", node_type=node.type
+    )
+
+
+def _normalize_program(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Program:
+    body = _normalize_children(node, source, diagnostics)
+    return Program(body=tuple(body), span=_span(node))
+
+
+def _normalize_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> ASTNode | None:
+    """Normalize a 'command' node.
+
+    In tree-sitter-bash, a 'command' node with a 'command_name' child
+    is a simple command. Otherwise, dispatch to contained nodes.
+    """
+    # Check if this is a simple command (has command_name child)
+    has_command_name = any(
+        c.type == "command_name" for c in node.children if c.is_named
+    )
+    if has_command_name:
+        return _normalize_ts_command(node, source, diagnostics)
+
+    named = _named_children(node)
+    if not named:
+        return None
+    if len(named) == 1:
+        return _normalize_node(named[0], source, diagnostics)
+    # Multiple named children — treat as sequence
+    children: list[ASTNode] = []
+    for child in named:
+        try:
+            ast_node = _normalize_node(child, source, diagnostics)
+            if ast_node is not None:
+                children.append(ast_node)
+        except UnsupportedSyntaxError as e:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    message=f"Unsupported: {e}",
+                    span=_span(child),
+                )
+            )
+    if len(children) == 1:
+        return children[0]
+    return Sequence(commands=tuple(children), span=_span(node))
+
+
+def _normalize_ts_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize a tree-sitter 'command' node (with command_name) into SimpleCommand."""
+    words: list[Word] = []
+    assignments: list[AssignmentWord] = []
+    redirections: list[Redirection] = []
+
+    for child in node.children:
+        if not child.is_named:
+            continue
+        if child.type == "command_name":
+            # command_name contains a 'word' child
+            words.append(_normalize_word_node(child, source))
+        elif child.type == "variable_assignment":
+            assignments.append(_normalize_assignment(child, source, diagnostics))
+        elif child.type in ("file_redirect", "heredoc_redirect"):
+            redirections.append(_normalize_redirection(child, source, diagnostics))
+        elif child.type in (
+            "word",
+            "string",
+            "raw_string",
+            "concatenation",
+            "simple_expansion",
+            "expansion",
+            "command_substitution",
+            "number",
+        ):
+            words.append(_normalize_word_node(child, source))
+        else:
+            words.append(_normalize_word_node(child, source))
+
+    return SimpleCommand(
+        words=tuple(words),
+        assignments=tuple(assignments),
+        redirections=tuple(redirections),
+        span=_span(node),
+    )
+
+
+def _normalize_simple_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    words: list[Word] = []
+    assignments: list[AssignmentWord] = []
+    redirections: list[Redirection] = []
+
+    for child in node.children:
+        if not child.is_named:
+            continue
+        if child.type == "variable_assignment":
+            assignments.append(_normalize_assignment(child, source, diagnostics))
+        elif child.type in {"file_redirect", "heredoc_redirect"}:
+            redirections.append(_normalize_redirection(child, source, diagnostics))
+        elif child.type in (
+            "word",
+            "string",
+            "raw_string",
+            "concatenation",
+            "simple_expansion",
+            "expansion",
+            "command_substitution",
+            "number",
+        ):
+            words.append(_normalize_word_node(child, source))
+        else:
+            # Try to treat as a word
+            words.append(_normalize_word_node(child, source))
+
+    return SimpleCommand(
+        words=tuple(words),
+        assignments=tuple(assignments),
+        redirections=tuple(redirections),
+        span=_span(node),
+    )
+
+
+def _normalize_assignment(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> AssignmentWord:
+    name_node = node.child_by_field_name("name")
+    value_node = node.child_by_field_name("value")
+
+    name = _node_text(name_node, source) if name_node else ""
+    value = _normalize_word_node(value_node, source) if value_node else None
+
+    return AssignmentWord(name=name, value=value, span=_span(node))
+
+
+def _normalize_redirection(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Redirection:
+    fd: int | None = None
+    op = ""
+    target_word: Word | None = None
+
+    for child in node.children:
+        if child.type == "file_descriptor":
+            fd = int(_node_text(child, source))
+        elif not child.is_named:
+            text = _node_text(child, source)
+            if text in (">", ">>", "<", "<<", ">&", "<&", "2>", "2>>"):
+                op = text
+        else:
+            target_word = _normalize_word_node(child, source)
+
+    if not op:
+        # Infer from the full text
+        full = _node_text(node, source)
+        for candidate in (">>", ">", "<<", "<", ">&", "<&"):
+            if candidate in full:
+                op = candidate
+                break
+
+    if target_word is None:
+        target_word = Word(segments=(LiteralSegment(value=""),), span=_span(node))
+
+    return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
+
+
+def _normalize_pipeline(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Pipeline | ASTNode:
+    negated = False
+    commands: list[ASTNode] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text == "!":
+                negated = True
+            continue
+        try:
+            ast_node = _normalize_node(child, source, diagnostics)
+            if ast_node is not None:
+                commands.append(ast_node)
+        except UnsupportedSyntaxError as e:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    message=f"Unsupported in pipeline: {e}",
+                    span=_span(child),
+                )
+            )
+
+    if len(commands) == 1 and not negated:
+        return commands[0]
+
+    return Pipeline(commands=tuple(commands), negated=negated, span=_span(node))
+
+
+def _normalize_list(node: Node, source: str, diagnostics: list[Diagnostic]) -> ASTNode:
+    """Normalize a 'list' node.
+
+    In tree-sitter-bash, 'list' is used for both:
+    - Semicolon/newline separated commands
+    - And/or lists (&&, ||)
+    We detect which case based on operators between children.
+    """
+    # Check for && or || operators
+    operators: list[str] = []
+    commands: list[ASTNode] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text in ("&&", "||"):
+                operators.append(text)
+            continue
+        try:
+            ast_node = _normalize_node(child, source, diagnostics)
+            if ast_node is not None:
+                commands.append(ast_node)
+        except UnsupportedSyntaxError as e:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    message=f"Unsupported in list: {e}",
+                    span=_span(child),
+                )
+            )
+
+    if len(commands) == 1:
+        return commands[0]
+
+    # If we found && or || operators, this is an AndOrList
+    if operators:
+        return AndOrList(
+            operators=tuple(operators),
+            commands=tuple(commands),
+            span=_span(node),
+        )
+
+    return Sequence(commands=tuple(commands), span=_span(node))
+
+
+def _normalize_and_or(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> AndOrList:
+    operators: list[str] = []
+    commands: list[ASTNode] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text in ("&&", "||"):
+                operators.append(text)
+            continue
+        try:
+            ast_node = _normalize_node(child, source, diagnostics)
+            if ast_node is not None:
+                commands.append(ast_node)
+        except UnsupportedSyntaxError as e:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    message=f"Unsupported in and/or: {e}",
+                    span=_span(child),
+                )
+            )
+
+    return AndOrList(
+        operators=tuple(operators),
+        commands=tuple(commands),
+        span=_span(node),
+    )
+
+
+def _normalize_subshell(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Subshell:
+    children = _normalize_children(node, source, diagnostics)
+    if len(children) == 1:
+        body = children[0]
+    else:
+        body = Sequence(commands=tuple(children), span=_span(node))
+    return Subshell(body=body, span=_span(node))
+
+
+def _normalize_group(node: Node, source: str, diagnostics: list[Diagnostic]) -> Group:
+    children = _normalize_children(node, source, diagnostics)
+    if len(children) == 1:
+        body = children[0]
+    else:
+        body = Sequence(commands=tuple(children), span=_span(node))
+    return Group(body=body, span=_span(node))
+
+
+def _normalize_function_def(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> FunctionDef:
+    name = ""
+    body: ASTNode | None = None
+
+    name_node = node.child_by_field_name("name")
+    body_node = node.child_by_field_name("body")
+
+    if name_node:
+        name = _node_text(name_node, source)
+    if body_node:
+        try:
+            body = _normalize_node(body_node, source, diagnostics)
+        except UnsupportedSyntaxError:
+            body = None
+
+    if body is None:
+        # Fallback: try to find body in children
+        for child in _named_children(node):
+            if child.type in ("compound_statement", "subshell", "list"):
+                body = _normalize_node(child, source, diagnostics)
+                break
+
+    if body is None:
+        body = Sequence(commands=(), span=_span(node))
+
+    return FunctionDef(name=name, body=body, span=_span(node))
+
+
+def _normalize_negated_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Pipeline:
+    children = _normalize_children(node, source, diagnostics)
+    if len(children) == 1:
+        return Pipeline(commands=(children[0],), negated=True, span=_span(node))
+    return Pipeline(commands=tuple(children), negated=True, span=_span(node))
+
+
+def _normalize_variable_assignments(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize multiple variable assignments (FOO=bar BAR=baz)."""
+    assignments: list[AssignmentWord] = []
+    for child in node.children:
+        if child.is_named and child.type == "variable_assignment":
+            assignments.append(_normalize_assignment(child, source, diagnostics))
+    return SimpleCommand(
+        words=(),
+        assignments=tuple(assignments),
+        redirections=(),
+        span=_span(node),
+    )
+
+
+def _normalize_unset_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize an unset_command into a SimpleCommand."""
+    words: list[Word] = [
+        Word(segments=(LiteralSegment(value="unset"),), span=_span(node))
+    ]
+    for child in node.children:
+        if child.is_named and child.type in ("variable_name", "word"):
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=_node_text(child, source)),),
+                    span=_span(child),
+                )
+            )
+    return SimpleCommand(
+        words=tuple(words),
+        assignments=(),
+        redirections=(),
+        span=_span(node),
+    )
+
+
+def _normalize_declaration_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize a declaration_command (export, declare, local, etc.).
+
+    Tree-sitter: declaration_command has the keyword (export/declare/local)
+    as an unnamed child and variable_assignment(s) as named children.
+    """
+    cmd_word: Word | None = None
+    words: list[Word] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text in ("export", "declare", "local", "readonly", "typeset"):
+                cmd_word = Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            continue
+        if child.type == "variable_assignment":
+            # Convert to a word arg like "FOO=bar" for the builtin
+            name_node = child.child_by_field_name("name")
+            value_node = child.child_by_field_name("value")
+            name = _node_text(name_node, source) if name_node else ""
+            if value_node:
+                value_text = _node_text(value_node, source)
+                words.append(
+                    Word(
+                        segments=(LiteralSegment(value=f"{name}={value_text}"),),
+                        span=_span(child),
+                    )
+                )
+            else:
+                words.append(
+                    Word(
+                        segments=(LiteralSegment(value=name),),
+                        span=_span(child),
+                    )
+                )
+        elif child.type in ("word", "string", "raw_string", "simple_expansion"):
+            words.append(_normalize_word_node(child, source))
+
+    all_words: list[Word] = []
+    if cmd_word:
+        all_words.append(cmd_word)
+    all_words.extend(words)
+
+    return SimpleCommand(
+        words=tuple(all_words),
+        assignments=(),
+        redirections=(),
+        span=_span(node),
+    )
+
+
+def _normalize_standalone_assignment(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize a top-level variable_assignment into a SimpleCommand with no words."""
+    assignment = _normalize_assignment(node, source, diagnostics)
+    return SimpleCommand(
+        words=(),
+        assignments=(assignment,),
+        redirections=(),
+        span=_span(node),
+    )
+
+
+def _normalize_redirected_statement(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> ASTNode:
+    """A redirected_statement wraps a command with redirections."""
+    body_node = node.child_by_field_name("body")
+    redirect_nodes = [
+        c
+        for c in node.children
+        if c.is_named and c.type in ("file_redirect", "heredoc_redirect")
+    ]
+
+    if body_node is not None:
+        inner = _normalize_node(body_node, source, diagnostics)
+        if isinstance(inner, SimpleCommand) and redirect_nodes:
+            extra_redirs = [
+                _normalize_redirection(r, source, diagnostics) for r in redirect_nodes
+            ]
+            return SimpleCommand(
+                words=inner.words,
+                assignments=inner.assignments,
+                redirections=inner.redirections + tuple(extra_redirs),
+                span=_span(node),
+            )
+        return inner  # type: ignore[return-value]
+
+    # Fallback
+    children = _normalize_children(node, source, diagnostics)
+    if len(children) == 1:
+        return children[0]
+    return Sequence(commands=tuple(children), span=_span(node))
+
+
+# --- Word normalization ---
+
+
+def _normalize_word_node(node: Node, source: str) -> Word:
+    """Convert a CST word-like node into a Word with segments."""
+    segments = _extract_segments(node, source)
+    if not segments:
+        segments = [LiteralSegment(value=_node_text(node, source))]
+    return Word(segments=tuple(segments), span=_span(node))
+
+
+def _extract_segments(node: Node, source: str) -> list[WordSegment]:  # noqa: C901
+    """Recursively extract word segments from a CST node."""
+    ntype = node.type
+
+    if ntype == "word":
+        text = _node_text(node, source)
+        # Check for glob characters in unquoted words
+        if any(c in text for c in ("*", "?", "[")):
+            return [GlobSegment(pattern=text)]
+        return [LiteralSegment(value=text)]
+
+    if ntype == "number":
+        return [LiteralSegment(value=_node_text(node, source))]
+
+    if ntype == "raw_string":
+        # Single-quoted string: 'content'
+        text = _node_text(node, source)
+        # Strip surrounding quotes
+        if text.startswith("'") and text.endswith("'"):
+            text = text[1:-1]
+        return [SingleQuotedSegment(value=text)]
+
+    if ntype == "string":
+        # Double-quoted string: "content"
+        return _extract_double_quoted(node, source)
+
+    if ntype == "simple_expansion":
+        # $VAR — use helper to properly extract variable name
+        prefix, var_name = _extract_simple_expansion(node, source)
+        result: list[WordSegment] = []
+        if prefix:
+            result.append(LiteralSegment(value=prefix))
+        result.append(ParameterExpansionSegment(name=var_name))
+        return result
+
+    if ntype == "expansion":
+        # ${VAR}, ${VAR:-default}, etc.
+        return [_parse_expansion(node, source)]
+
+    if ntype == "command_substitution":
+        # $(command)
+        text = _node_text(node, source)
+        if text.startswith("$(") and text.endswith(")"):
+            cmd = text[2:-1]
+        elif text.startswith("`") and text.endswith("`"):
+            cmd = text[1:-1]
+        else:
+            cmd = text
+        return [CommandSubstitutionSegment(command=cmd)]
+
+    if ntype == "arithmetic_expansion":
+        text = _node_text(node, source)
+        expr = text[3:-2] if text.startswith("$((") and text.endswith("))") else text
+        return [ArithmeticExpansionSegment(expression=expr)]
+
+    if ntype == "concatenation":
+        segments: list[WordSegment] = []
+        for child in node.children:
+            if child.is_named:
+                segments.extend(_extract_segments(child, source))
+            else:
+                text = _node_text(child, source)
+                if text:
+                    segments.append(LiteralSegment(value=text))
+        return segments
+
+    if ntype == "string_content":
+        return [LiteralSegment(value=_node_text(node, source))]
+
+    # Fallback: treat as literal
+    return [LiteralSegment(value=_node_text(node, source))]
+
+
+def _extract_simple_expansion(node: Node, source: str) -> tuple[str, str]:
+    """Extract the variable name from a simple_expansion node.
+
+    Returns (prefix_text, var_name). The prefix is any text before the $
+    that tree-sitter includes in the span (e.g. spaces).
+    """
+    # Look for variable_name or special_variable_name child
+    for child in node.children:
+        if child.type in ("variable_name", "special_variable_name"):
+            var_name = _node_text(child, source)
+            # Calculate prefix: text between node start and $
+            full_text = _node_text(node, source)
+            dollar_idx = full_text.find("$")
+            prefix = full_text[:dollar_idx] if dollar_idx > 0 else ""
+            return prefix, var_name
+
+    # Fallback: strip $ from text
+    full_text = _node_text(node, source)
+    dollar_idx = full_text.find("$")
+    if dollar_idx >= 0:
+        prefix = full_text[:dollar_idx]
+        var_name = full_text[dollar_idx + 1 :]
+        return prefix, var_name
+
+    return "", full_text.lstrip("$")
+
+
+def _extract_double_quoted(node: Node, source: str) -> list[WordSegment]:
+    """Extract segments from a double-quoted string node."""
+    segments: list[WordSegment] = []
+    inner_segments: list[WordSegment] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text not in ('"',):
+                inner_segments.append(LiteralSegment(value=text))
+        elif child.type == "string_content":
+            inner_segments.append(LiteralSegment(value=_node_text(child, source)))
+        elif child.type == "simple_expansion":
+            # Extract leading text before the $ as a literal segment
+            prefix, var_name = _extract_simple_expansion(child, source)
+            if prefix:
+                inner_segments.append(LiteralSegment(value=prefix))
+            inner_segments.append(ParameterExpansionSegment(name=var_name))
+        elif child.type == "expansion":
+            # Handle leading whitespace before ${
+            full_text = _node_text(child, source)
+            brace_idx = full_text.find("${")
+            if brace_idx > 0:
+                inner_segments.append(LiteralSegment(value=full_text[:brace_idx]))
+            inner_segments.append(_parse_expansion(child, source))
+        elif child.type == "command_substitution":
+            text = _node_text(child, source)
+            if text.startswith("$(") and text.endswith(")"):
+                cmd = text[2:-1]
+            elif text.startswith("`") and text.endswith("`"):
+                cmd = text[1:-1]
+            else:
+                cmd = text
+            inner_segments.append(CommandSubstitutionSegment(command=cmd))
+        elif child.type == "arithmetic_expansion":
+            text = _node_text(child, source)
+            if text.startswith("$((") and text.endswith("))"):
+                expr = text[3:-2]
+            else:
+                expr = text
+            inner_segments.append(ArithmeticExpansionSegment(expression=expr))
+        else:
+            inner_segments.extend(_extract_segments(child, source))
+
+    from agentsh.ast.words import DoubleQuotedSegment
+
+    # Always create a DoubleQuotedSegment, even for empty strings like ""
+    segments.append(DoubleQuotedSegment(segments=tuple(inner_segments)))
+
+    return segments
+
+
+def _parse_expansion(node: Node, source: str) -> ParameterExpansionSegment:
+    """Parse a ${...} expansion node.
+
+    Use child nodes when available for accuracy, falling back to text parsing.
+    """
+    text = _node_text(node, source)
+    # Find the actual ${...} content
+    brace_start = text.find("${")
+    if brace_start >= 0 and text.endswith("}"):
+        inner = text[brace_start + 2 : -1]
+    elif text.startswith("${") and text.endswith("}"):
+        inner = text[2:-1]
+    else:
+        inner = text.lstrip(" $")
+
+    # Check for operators: :-, :+, :=, :?, -, +, =, ?
+    for op in (":-", ":+", ":=", ":?", "-", "+", "=", "?", "##", "#", "%%", "%"):
+        idx = inner.find(op)
+        if idx > 0:
+            name = inner[:idx]
+            argument = inner[idx + len(op) :]
+            return ParameterExpansionSegment(name=name, operator=op, argument=argument)
+
+    return ParameterExpansionSegment(name=inner)
+
+
+def _normalize_if_statement(  # noqa: C901
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> IfClause:
+    """Normalize an if/elif/else statement into an IfClause AST node.
+
+    tree-sitter-bash CST structure:
+      if_statement -> if, condition_cmd, ;, then, body_cmd, ;,
+                      [elif_clause -> elif, cond, ;, then, body, ;]*,
+                      [else_clause -> else, body, ;],
+                      fi
+    The condition and body are direct named children between keywords.
+    elif_clause and else_clause are named nodes wrapping their content.
+    """
+    conditions: list[ASTNode] = []
+    bodies: list[ASTNode] = []
+    else_body: ASTNode | None = None
+
+    # Phase 1: collect condition and body from if-branch
+    phase = "seek_cond"
+    cond_parts: list[ASTNode] = []
+    body_parts: list[ASTNode] = []
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text == "if":
+                phase = "cond"
+            elif text == "then":
+                if cond_parts:
+                    conditions.append(
+                        cond_parts[0]
+                        if len(cond_parts) == 1
+                        else Sequence(commands=tuple(cond_parts), span=_span(node))
+                    )
+                    cond_parts = []
+                phase = "body"
+            elif text == "fi":
+                pass
+            continue
+
+        # Named children
+        if child.type == "elif_clause":
+            # Finalize current body
+            if body_parts:
+                bodies.append(
+                    body_parts[0]
+                    if len(body_parts) == 1
+                    else Sequence(commands=tuple(body_parts), span=_span(node))
+                )
+                body_parts = []
+            # Parse elif recursively
+            elif_cond, elif_body = _parse_elif_clause(child, source, diagnostics)
+            conditions.append(elif_cond)
+            bodies.append(elif_body)
+
+        elif child.type == "else_clause":
+            # Finalize current body
+            if body_parts:
+                bodies.append(
+                    body_parts[0]
+                    if len(body_parts) == 1
+                    else Sequence(commands=tuple(body_parts), span=_span(node))
+                )
+                body_parts = []
+            # Parse else body
+            else_parts = _normalize_children(child, source, diagnostics)
+            if else_parts:
+                else_body = (
+                    else_parts[0]
+                    if len(else_parts) == 1
+                    else Sequence(commands=tuple(else_parts), span=_span(child))
+                )
+
+        elif phase == "cond":
+            try:
+                n = _normalize_node(child, source, diagnostics)
+                if n is not None:
+                    cond_parts.append(n)
+            except UnsupportedSyntaxError:
+                pass
+
+        elif phase == "body":
+            try:
+                n = _normalize_node(child, source, diagnostics)
+                if n is not None:
+                    body_parts.append(n)
+            except UnsupportedSyntaxError:
+                pass
+
+    # Finalize last body
+    if body_parts:
+        bodies.append(
+            body_parts[0]
+            if len(body_parts) == 1
+            else Sequence(commands=tuple(body_parts), span=_span(node))
+        )
+
+    return IfClause(
+        conditions=tuple(conditions),
+        bodies=tuple(bodies),
+        else_body=else_body,
+        span=_span(node),
+    )
+
+
+def _parse_elif_clause(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> tuple[ASTNode, ASTNode]:
+    """Parse an elif_clause into (condition, body)."""
+    cond_parts: list[ASTNode] = []
+    body_parts: list[ASTNode] = []
+    phase = "cond"
+
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text == "then":
+                phase = "body"
+            continue
+
+        target = cond_parts if phase == "cond" else body_parts
+        try:
+            n = _normalize_node(child, source, diagnostics)
+            if n is not None:
+                target.append(n)
+        except UnsupportedSyntaxError:
+            pass
+
+    condition: ASTNode = (
+        cond_parts[0]
+        if len(cond_parts) == 1
+        else Sequence(commands=tuple(cond_parts), span=_span(node))
+    )
+    body: ASTNode = (
+        body_parts[0]
+        if len(body_parts) == 1
+        else Sequence(commands=tuple(body_parts), span=_span(node))
+    )
+    return condition, body
+
+
+def _normalize_for_statement(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> ForLoop:
+    """Normalize a for loop into a ForLoop AST node."""
+    variable = ""
+    words: list[Word] | None = None
+    body: ASTNode = Sequence(commands=(), span=_span(node))
+
+    var_node = node.child_by_field_name("variable")
+    if var_node:
+        variable = _node_text(var_node, source)
+
+    # Find 'in' words
+    in_found = False
+    for child in node.children:
+        if child.type == "in":
+            in_found = True
+            continue
+        if in_found and child.type in ("do", ";", "\n"):
+            break
+        if in_found and child.is_named:
+            words = words or []
+            words.append(_normalize_word_node(child, source))
+
+    # Find body (do_group)
+    body_node = node.child_by_field_name("body")
+    if body_node:
+        body_children = _normalize_children(body_node, source, diagnostics)
+        if len(body_children) == 1:
+            body = body_children[0]
+        elif body_children:
+            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+
+    return ForLoop(
+        variable=variable,
+        words=tuple(words) if words else None,
+        body=body,
+        span=_span(node),
+    )
+
+
+def _normalize_while_statement(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> WhileLoop | UntilLoop:
+    """Normalize a while/until loop.
+
+    tree-sitter reports both ``while`` and ``until`` as
+    ``while_statement``; the keyword child distinguishes them.
+    """
+    condition, body = _extract_loop_condition_body(node, source, diagnostics)
+    # Check first child text for "until" keyword
+    first = node.children[0] if node.children else None
+    if first is not None and first.type == "until":
+        return UntilLoop(condition=condition, body=body, span=_span(node))
+    return WhileLoop(condition=condition, body=body, span=_span(node))
+
+
+def _normalize_until_statement(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> UntilLoop:
+    """Normalize an until loop into an UntilLoop AST node."""
+    condition, body = _extract_loop_condition_body(node, source, diagnostics)
+    return UntilLoop(condition=condition, body=body, span=_span(node))
+
+
+def _extract_loop_condition_body(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> tuple[ASTNode, ASTNode]:
+    """Extract condition and body from while/until via field names."""
+    empty_cmd: ASTNode = SimpleCommand(
+        words=(), assignments=(), redirections=(), span=_span(node)
+    )
+    condition: ASTNode = empty_cmd
+    body: ASTNode = Sequence(commands=(), span=_span(node))
+
+    cond_node = node.child_by_field_name("condition")
+    body_node = node.child_by_field_name("body")
+
+    if cond_node:
+        # Try to normalize the condition node directly first
+        try:
+            result = _normalize_node(cond_node, source, diagnostics)
+            condition = result if result is not None else empty_cmd
+        except UnsupportedSyntaxError:
+            # Fall back to normalizing its children
+            cond_children = _normalize_children(cond_node, source, diagnostics)
+            if len(cond_children) == 1:
+                condition = cond_children[0]
+            elif cond_children:
+                condition = Sequence(
+                    commands=tuple(cond_children), span=_span(cond_node)
+                )
+
+    if body_node:
+        body_children = _normalize_children(body_node, source, diagnostics)
+        if len(body_children) == 1:
+            body = body_children[0]
+        elif body_children:
+            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+
+    return condition, body
+
+
+def _normalize_case_statement(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> CaseClause:
+    """Normalize a case statement into a CaseClause AST node."""
+    word_node = node.child_by_field_name("value")
+    word = (
+        _normalize_word_node(word_node, source)
+        if word_node
+        else Word(
+            segments=(LiteralSegment(value=""),),
+            span=_span(node),
+        )
+    )
+
+    items: list[CaseItem] = []
+    for child in node.children:
+        if child.type == "case_item":
+            patterns: list[Word] = []
+            body_parts: list[ASTNode] = []
+            in_body = False
+            for item_child in child.children:
+                if not item_child.is_named:
+                    text = _node_text(item_child, source)
+                    if text == ")":
+                        in_body = True
+                    continue
+                if not in_body:
+                    # Pattern: word, extglob_pattern, string, etc.
+                    patterns.append(_normalize_word_node(item_child, source))
+                else:
+                    try:
+                        n = _normalize_node(item_child, source, diagnostics)
+                        if n is not None:
+                            body_parts.append(n)
+                    except UnsupportedSyntaxError:
+                        pass
+            item_body: ASTNode | None = None
+            if len(body_parts) == 1:
+                item_body = body_parts[0]
+            elif body_parts:
+                item_body = Sequence(commands=tuple(body_parts), span=_span(child))
+            items.append(
+                CaseItem(
+                    patterns=tuple(patterns),
+                    body=item_body,
+                    span=_span(child),
+                )
+            )
+
+    return CaseClause(word=word, items=tuple(items), span=_span(node))
+
+
+# Node type -> handler mapping
+def _normalize_test_command(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> SimpleCommand:
+    """Normalize a test_command ([ ... ] or test ...) into SimpleCommand."""
+    words: list[Word] = []
+    _flatten_test_children(node, source, words)
+    return SimpleCommand(
+        words=tuple(words),
+        assignments=(),
+        redirections=(),
+        span=_span(node),
+    )
+
+
+def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
+    """Recursively flatten test_command children into a word list."""
+    for child in node.children:
+        ctype = child.type
+        text = _node_text(child, source)
+
+        if ctype in ("[", "]") or ctype == "test_operator":
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+        elif ctype in ("unary_expression", "binary_expression"):
+            _flatten_test_children(child, source, words)
+        elif ctype == "number":
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+        elif child.is_named:
+            words.append(_normalize_word_node(child, source))
+        elif text not in ("", " ", "(", ")"):
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=text),),
+                    span=_span(child),
+                )
+            )
+
+
+_NODE_HANDLERS: dict[str, Callable[..., Any]] = {
+    "program": _normalize_program,
+    "command": _normalize_command,
+    "simple_command": _normalize_simple_command,
+    "pipeline": _normalize_pipeline,
+    "list": _normalize_list,
+    "subshell": _normalize_subshell,
+    "compound_statement": _normalize_group,
+    "function_definition": _normalize_function_def,
+    "negated_command": _normalize_negated_command,
+    "redirected_statement": _normalize_redirected_statement,
+    "variable_assignment": _normalize_standalone_assignment,
+    "declaration_command": _normalize_declaration_command,
+    "unset_command": _normalize_unset_command,
+    "variable_assignments": _normalize_variable_assignments,
+    "if_statement": _normalize_if_statement,
+    "for_statement": _normalize_for_statement,
+    "while_statement": _normalize_while_statement,
+    "until_statement": _normalize_until_statement,
+    "case_statement": _normalize_case_statement,
+    "test_command": _normalize_test_command,
+    "do_group": _normalize_list,
+}
+
+# Types we silently skip
+_IGNORED_TYPES: set[str] = {
+    "comment",
+    "\n",
+}
