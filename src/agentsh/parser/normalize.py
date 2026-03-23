@@ -15,6 +15,7 @@ from agentsh.ast.nodes import (
     AndOrList,
     ArrayAssignmentWord,
     AssignmentWord,
+    ASTNode,
     CaseClause,
     CaseItem,
     CStyleForLoop,
@@ -51,16 +52,8 @@ from agentsh.parser.diagnostics import (
     UnsupportedSyntaxError,
 )
 
-# AST node type
-ASTNode = (
-    Program
-    | Sequence
-    | AndOrList
-    | Pipeline
-    | SimpleCommand
-    | Group
-    | Subshell
-    | FunctionDef
+_REDIRECT_TYPES: frozenset[str] = frozenset(
+    {"file_redirect", "heredoc_redirect", "herestring_redirect"}
 )
 
 
@@ -79,6 +72,38 @@ def _node_text(node: Node, source: str) -> str:
 
 def _named_children(node: Node) -> list[Node]:
     return [c for c in node.children if c.is_named]
+
+
+def _try_normalize_node(
+    child: Node,
+    source: str,
+    diagnostics: list[Diagnostic],
+    target: list[ASTNode],
+) -> None:
+    """Normalize *child* and append the result to *target*.
+
+    If normalization raises :class:`UnsupportedSyntaxError`, a warning
+    diagnostic is emitted instead.
+    """
+    try:
+        ast_node = _normalize_node(child, source, diagnostics)
+        if ast_node is not None:
+            target.append(ast_node)
+    except UnsupportedSyntaxError as e:
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.WARNING,
+                message=f"Unsupported syntax: {e}",
+                span=_span(child),
+            )
+        )
+
+
+def _as_body(parts: list[ASTNode], span: Span) -> ASTNode:
+    """Collapse a list of nodes into a single body node."""
+    if len(parts) == 1:
+        return parts[0]
+    return Sequence(commands=tuple(parts), span=span)
 
 
 def normalize(root: Node, source: str) -> tuple[Program, list[Diagnostic]]:
@@ -155,7 +180,7 @@ def _normalize_command(
         c.type == "command_name" for c in node.children if c.is_named
     )
     if has_command_name:
-        return _normalize_ts_command(node, source, diagnostics)
+        return _normalize_simple_command(node, source, diagnostics)
 
     named = _named_children(node)
     if not named:
@@ -177,49 +202,7 @@ def _normalize_command(
                     span=_span(child),
                 )
             )
-    if len(children) == 1:
-        return children[0]
-    return Sequence(commands=tuple(children), span=_span(node))
-
-
-def _normalize_ts_command(
-    node: Node, source: str, diagnostics: list[Diagnostic]
-) -> SimpleCommand:
-    """Normalize a tree-sitter 'command' node (with command_name) into SimpleCommand."""
-    words: list[Word] = []
-    assignments: list[AssignmentWord | ArrayAssignmentWord] = []
-    redirections: list[Redirection] = []
-
-    for child in node.children:
-        if not child.is_named:
-            continue
-        if child.type == "command_name":
-            # command_name contains a 'word' child
-            words.append(_normalize_word_node(child, source))
-        elif child.type == "variable_assignment":
-            assignments.append(_normalize_assignment(child, source, diagnostics))
-        elif child.type in ("file_redirect", "heredoc_redirect", "herestring_redirect"):
-            redirections.append(_normalize_redirection(child, source, diagnostics))
-        elif child.type in (
-            "word",
-            "string",
-            "raw_string",
-            "concatenation",
-            "simple_expansion",
-            "expansion",
-            "command_substitution",
-            "number",
-        ):
-            words.append(_normalize_word_node(child, source))
-        else:
-            words.append(_normalize_word_node(child, source))
-
-    return SimpleCommand(
-        words=tuple(words),
-        assignments=tuple(assignments),
-        redirections=tuple(redirections),
-        span=_span(node),
-    )
+    return _as_body(children, _span(node))
 
 
 def _normalize_simple_command(
@@ -234,21 +217,10 @@ def _normalize_simple_command(
             continue
         if child.type == "variable_assignment":
             assignments.append(_normalize_assignment(child, source, diagnostics))
-        elif child.type in {"file_redirect", "heredoc_redirect", "herestring_redirect"}:
+        elif child.type in _REDIRECT_TYPES:
             redirections.append(_normalize_redirection(child, source, diagnostics))
-        elif child.type in (
-            "word",
-            "string",
-            "raw_string",
-            "concatenation",
-            "simple_expansion",
-            "expansion",
-            "command_substitution",
-            "number",
-        ):
-            words.append(_normalize_word_node(child, source))
         else:
-            # Try to treat as a word
+            # command_name, word, string, concatenation, expansion, etc.
             words.append(_normalize_word_node(child, source))
 
     return SimpleCommand(
@@ -412,158 +384,165 @@ def _scan_command_sub(
     return None, 0
 
 
+#: Operator strings checked in priority order for parameter expansions.
+_PARAM_OPERATORS: tuple[str, ...] = (
+    ":-",
+    ":+",
+    ":=",
+    ":?",
+    "-",
+    "+",
+    "=",
+    "?",
+    "//",
+    "/",
+    "##",
+    "#",
+    "%%",
+    "%",
+    "^^",
+    "^",
+    ",,",
+    ",",
+)
+
+
 def _parse_braced_param(inner: str) -> ParameterExpansionSegment:
-    """Parse the content inside ``${...}`` into a ParameterExpansionSegment."""
+    """Parse the content inside ``${...}`` into a ParameterExpansionSegment.
+
+    Delegates to the same helpers used by :func:`_parse_expansion`:
+    :func:`_parse_length_expansion` and :func:`_find_operator`.
+
+    Note: unlike :func:`_parse_expansion`, which uses the full tree-sitter
+    CST, this function operates on raw text extracted from heredoc bodies.
+    For subscript expressions with a trailing operator (e.g. ``arr[0]:-val``),
+    it falls through to :func:`_find_operator` so that the operator is
+    matched against the full inner string rather than the post-bracket suffix.
+    """
     # ${#var} — string length
     if inner.startswith("#") and not inner.startswith("##"):
-        rest = inner[1:]
-        if "[" in rest:
-            arr_name = rest[: rest.index("[")]
-            return ParameterExpansionSegment(
-                name=arr_name, operator="#[", argument=None
-            )
-        return ParameterExpansionSegment(name=rest, operator="#len", argument=None)
+        return _parse_length_expansion(inner[1:])
 
-    # ${arr[idx]}
+    # ${arr[idx]} — simple subscript only (no trailing operator)
     if "[" in inner:
         bracket_start = inner.index("[")
-        name = inner[:bracket_start]
         rest = inner[bracket_start:]
         bracket_end = rest.find("]")
         if bracket_end >= 0:
-            subscript = rest[1:bracket_end]
             after = rest[bracket_end + 1 :]
             if not after:
+                name = inner[:bracket_start]
+                subscript = rest[1:bracket_end]
                 return ParameterExpansionSegment(
                     name=name, operator="[", argument=subscript
                 )
 
-    # Check for operators
-    for op in (
-        ":-",
-        ":+",
-        ":=",
-        ":?",
-        "-",
-        "+",
-        "=",
-        "?",
-        "//",
-        "/",
-        "##",
-        "#",
-        "%%",
-        "%",
-        "^^",
-        "^",
-        ",,",
-        ",",
-    ):
-        idx = inner.find(op)
-        if idx > 0:
-            name = inner[:idx]
-            argument = inner[idx + len(op) :]
-            return ParameterExpansionSegment(name=name, operator=op, argument=argument)
-
-    return ParameterExpansionSegment(name=inner)
+    # Check for operators (:-  :+  //  ##  %% etc.)
+    return _find_operator(inner)
 
 
-def _normalize_redirection(  # noqa: C901
+def _normalize_herestring_redirect(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> Redirection:
+    """Normalize a here-string redirection (<<<)."""
+    fd: int | None = None
+    target_word: Word | None = None
+
+    for child in node.children:
+        if child.type == "file_descriptor":
+            fd = int(_node_text(child, source))
+        elif child.is_named and child.type != "file_descriptor":
+            target_word = _normalize_word_node(child, source)
+    if target_word is None:
+        full = _node_text(node, source)
+        idx = full.find("<<<")
+        body = full[idx + 3 :].strip() if idx >= 0 else ""
+        target_word = Word(segments=(LiteralSegment(value=body),), span=_span(node))
+    return Redirection(op="<<<", fd=fd, target=target_word, span=_span(node))
+
+
+def _normalize_heredoc_redirect(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Redirection:
+    """Normalize a here-doc redirection (<<, <<-)."""
+    fd: int | None = None
+
+    # Detect <<- (tab-stripping variant)
+    strip_tabs = False
+    for child in node.children:
+        if not child.is_named:
+            text = _node_text(child, source)
+            if text == "<<-":
+                strip_tabs = True
+
+    # Find the heredoc body node and delimiter
+    body_node = None
+    delimiter_node = None
+    for child in node.children:
+        if child.type == "heredoc_body":
+            body_node = child
+        elif child.type == "heredoc_start" or (
+            delimiter_node is None
+            and child.is_named
+            and child.type
+            not in (
+                "heredoc_body",
+                "heredoc_end",
+                "file_descriptor",
+            )
+        ):
+            delimiter_node = child
+
+    # Determine if delimiter was quoted (suppresses expansion)
+    quoted_delimiter = False
+    if delimiter_node:
+        dtxt = _node_text(delimiter_node, source)
+        if dtxt.startswith("'") or dtxt.startswith('"') or "\\" in dtxt:
+            quoted_delimiter = True
+
+    if body_node:
+        body_text = _node_text(body_node, source)
+        # Remove the trailing delimiter line
+        lines = body_text.split("\n")
+        if lines and lines[-1].strip() == "":
+            lines = lines[:-1]
+        # Strip tabs for <<-
+        if strip_tabs:
+            lines = [line.lstrip("\t") for line in lines]
+        body_text = "\n".join(lines)
+        if body_text and not body_text.endswith("\n"):
+            body_text += "\n"
+    else:
+        body_text = ""
+
+    if quoted_delimiter:
+        target_word = Word(
+            segments=(SingleQuotedSegment(value=body_text),), span=_span(node)
+        )
+    else:
+        # Unquoted delimiter: expand variables in the body
+        parsed_segments = _parse_heredoc_body(body_text)
+        target_word = Word(
+            segments=(DoubleQuotedSegment(segments=tuple(parsed_segments)),),
+            span=_span(node),
+        )
+    return Redirection(op="<<", fd=fd, target=target_word, span=_span(node))
+
+
+def _normalize_redirection(
+    node: Node, source: str, diagnostics: list[Diagnostic]
+) -> Redirection:
+    """Normalize a redirection node into a Redirection AST node."""
+    if node.type == "herestring_redirect":
+        return _normalize_herestring_redirect(node, source, diagnostics)
+    if node.type == "heredoc_redirect":
+        return _normalize_heredoc_redirect(node, source, diagnostics)
+
+    # --- normal file redirections ---
     fd: int | None = None
     op = ""
     target_word: Word | None = None
 
-    # --- here-string (<<<) ---
-    if node.type == "herestring_redirect":
-        op = "<<<"
-        for child in node.children:
-            if child.type == "file_descriptor":
-                fd = int(_node_text(child, source))
-            elif child.is_named and child.type != "file_descriptor":
-                target_word = _normalize_word_node(child, source)
-        if target_word is None:
-            full = _node_text(node, source)
-            idx = full.find("<<<")
-            body = full[idx + 3 :].strip() if idx >= 0 else ""
-            target_word = Word(segments=(LiteralSegment(value=body),), span=_span(node))
-        return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
-
-    # --- here-doc (<<, <<-) ---
-    if node.type == "heredoc_redirect":
-        op = "<<"
-        # Detect <<- (tab-stripping variant)
-        strip_tabs = False
-        for child in node.children:
-            if not child.is_named:
-                text = _node_text(child, source)
-                if text == "<<-":
-                    strip_tabs = True
-                    op = "<<"
-                elif text == "<<":
-                    op = "<<"
-
-        # Find the heredoc body node and delimiter
-        body_node = None
-        delimiter_node = None
-        for child in node.children:
-            if child.type == "heredoc_body":
-                body_node = child
-            elif child.type == "heredoc_start" or (
-                delimiter_node is None
-                and child.is_named
-                and child.type
-                not in (
-                    "heredoc_body",
-                    "heredoc_end",
-                    "file_descriptor",
-                )
-            ):
-                delimiter_node = child
-
-        # Determine if delimiter was quoted (suppresses expansion)
-        quoted_delimiter = False
-        if delimiter_node:
-            dtxt = _node_text(delimiter_node, source)
-            if dtxt.startswith("'") or dtxt.startswith('"') or "\\" in dtxt:
-                quoted_delimiter = True
-
-        if body_node:
-            body_text = _node_text(body_node, source)
-            # Remove the trailing delimiter line
-            lines = body_text.split("\n")
-            if lines and lines[-1].strip() == "":
-                lines = lines[:-1]
-            # Strip tabs for <<-
-            if strip_tabs:
-                lines = [line.lstrip("\t") for line in lines]
-            body_text = "\n".join(lines)
-            if body_text and not body_text.endswith("\n"):
-                body_text += "\n"
-        else:
-            body_text = ""
-
-        if quoted_delimiter:
-            target_word = Word(
-                segments=(SingleQuotedSegment(value=body_text),), span=_span(node)
-            )
-        else:
-            # Unquoted delimiter: expand variables in the body
-            parsed_segments = _parse_heredoc_body(body_text)
-            if parsed_segments:
-                target_word = Word(
-                    segments=(DoubleQuotedSegment(segments=tuple(parsed_segments)),),
-                    span=_span(node),
-                )
-            else:
-                target_word = Word(
-                    segments=(DoubleQuotedSegment(segments=()),),
-                    span=_span(node),
-                )
-        return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
-
-    # --- normal file redirections ---
     for child in node.children:
         if child.type == "file_descriptor":
             fd = int(_node_text(child, source))
@@ -700,20 +679,12 @@ def _normalize_subshell(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> Subshell:
     children = _normalize_children(node, source, diagnostics)
-    if len(children) == 1:
-        body = children[0]
-    else:
-        body = Sequence(commands=tuple(children), span=_span(node))
-    return Subshell(body=body, span=_span(node))
+    return Subshell(body=_as_body(children, _span(node)), span=_span(node))
 
 
 def _normalize_group(node: Node, source: str, diagnostics: list[Diagnostic]) -> Group:
     children = _normalize_children(node, source, diagnostics)
-    if len(children) == 1:
-        body = children[0]
-    else:
-        body = Sequence(commands=tuple(children), span=_span(node))
-    return Group(body=body, span=_span(node))
+    return Group(body=_as_body(children, _span(node)), span=_span(node))
 
 
 def _normalize_function_def(
@@ -892,10 +863,7 @@ def _normalize_redirected_statement(
     """A redirected_statement wraps a command with redirections."""
     body_node = node.child_by_field_name("body")
     redirect_nodes = [
-        c
-        for c in node.children
-        if c.is_named
-        and c.type in ("file_redirect", "heredoc_redirect", "herestring_redirect")
+        c for c in node.children if c.is_named and c.type in _REDIRECT_TYPES
     ]
 
     if body_node is not None:
@@ -914,9 +882,7 @@ def _normalize_redirected_statement(
 
     # Fallback
     children = _normalize_children(node, source, diagnostics)
-    if len(children) == 1:
-        return children[0]
-    return Sequence(commands=tuple(children), span=_span(node))
+    return _as_body(children, _span(node))
 
 
 # --- Word normalization ---
@@ -1194,29 +1160,6 @@ def _parse_substring_expansion(
     return None
 
 
-#: Operator strings checked in priority order for parameter expansions.
-_PARAM_OPERATORS: tuple[str, ...] = (
-    ":-",
-    ":+",
-    ":=",
-    ":?",
-    "-",
-    "+",
-    "=",
-    "?",
-    "//",
-    "/",
-    "##",
-    "#",
-    "%%",
-    "%",
-    "^^",
-    "^",
-    ",,",
-    ",",
-)
-
-
 def _find_operator(inner: str) -> ParameterExpansionSegment:
     """Scan *inner* for a known parameter expansion operator."""
     for op in _PARAM_OPERATORS:
@@ -1228,7 +1171,7 @@ def _find_operator(inner: str) -> ParameterExpansionSegment:
     return ParameterExpansionSegment(name=inner)
 
 
-def _normalize_if_statement(  # noqa: C901
+def _normalize_if_statement(
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> IfClause:
     """Normalize an if/elif/else statement into an IfClause AST node.
@@ -1257,11 +1200,7 @@ def _normalize_if_statement(  # noqa: C901
                 phase = "cond"
             elif text == "then":
                 if cond_parts:
-                    conditions.append(
-                        cond_parts[0]
-                        if len(cond_parts) == 1
-                        else Sequence(commands=tuple(cond_parts), span=_span(node))
-                    )
+                    conditions.append(_as_body(cond_parts, _span(node)))
                     cond_parts = []
                 phase = "body"
             elif text == "fi":
@@ -1272,11 +1211,7 @@ def _normalize_if_statement(  # noqa: C901
         if child.type == "elif_clause":
             # Finalize current body
             if body_parts:
-                bodies.append(
-                    body_parts[0]
-                    if len(body_parts) == 1
-                    else Sequence(commands=tuple(body_parts), span=_span(node))
-                )
+                bodies.append(_as_body(body_parts, _span(node)))
                 body_parts = []
             # Parse elif recursively
             elif_cond, elif_body = _parse_elif_clause(child, source, diagnostics)
@@ -1286,44 +1221,22 @@ def _normalize_if_statement(  # noqa: C901
         elif child.type == "else_clause":
             # Finalize current body
             if body_parts:
-                bodies.append(
-                    body_parts[0]
-                    if len(body_parts) == 1
-                    else Sequence(commands=tuple(body_parts), span=_span(node))
-                )
+                bodies.append(_as_body(body_parts, _span(node)))
                 body_parts = []
             # Parse else body
             else_parts = _normalize_children(child, source, diagnostics)
             if else_parts:
-                else_body = (
-                    else_parts[0]
-                    if len(else_parts) == 1
-                    else Sequence(commands=tuple(else_parts), span=_span(child))
-                )
+                else_body = _as_body(else_parts, _span(child))
 
         elif phase == "cond":
-            try:
-                n = _normalize_node(child, source, diagnostics)
-                if n is not None:
-                    cond_parts.append(n)
-            except UnsupportedSyntaxError:
-                pass
+            _try_normalize_node(child, source, diagnostics, cond_parts)
 
         elif phase == "body":
-            try:
-                n = _normalize_node(child, source, diagnostics)
-                if n is not None:
-                    body_parts.append(n)
-            except UnsupportedSyntaxError:
-                pass
+            _try_normalize_node(child, source, diagnostics, body_parts)
 
     # Finalize last body
     if body_parts:
-        bodies.append(
-            body_parts[0]
-            if len(body_parts) == 1
-            else Sequence(commands=tuple(body_parts), span=_span(node))
-        )
+        bodies.append(_as_body(body_parts, _span(node)))
 
     return IfClause(
         conditions=tuple(conditions),
@@ -1349,23 +1262,10 @@ def _parse_elif_clause(
             continue
 
         target = cond_parts if phase == "cond" else body_parts
-        try:
-            n = _normalize_node(child, source, diagnostics)
-            if n is not None:
-                target.append(n)
-        except UnsupportedSyntaxError:
-            pass
+        _try_normalize_node(child, source, diagnostics, target)
 
-    condition: ASTNode = (
-        cond_parts[0]
-        if len(cond_parts) == 1
-        else Sequence(commands=tuple(cond_parts), span=_span(node))
-    )
-    body: ASTNode = (
-        body_parts[0]
-        if len(body_parts) == 1
-        else Sequence(commands=tuple(body_parts), span=_span(node))
-    )
+    condition = _as_body(cond_parts, _span(node))
+    body = _as_body(body_parts, _span(node))
     return condition, body
 
 
@@ -1397,10 +1297,8 @@ def _normalize_for_statement(
     body_node = node.child_by_field_name("body")
     if body_node:
         body_children = _normalize_children(body_node, source, diagnostics)
-        if len(body_children) == 1:
-            body = body_children[0]
-        elif body_children:
-            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+        if body_children:
+            body = _as_body(body_children, _span(body_node))
 
     return ForLoop(
         variable=variable,
@@ -1455,19 +1353,13 @@ def _extract_loop_condition_body(
         except UnsupportedSyntaxError:
             # Fall back to normalizing its children
             cond_children = _normalize_children(cond_node, source, diagnostics)
-            if len(cond_children) == 1:
-                condition = cond_children[0]
-            elif cond_children:
-                condition = Sequence(
-                    commands=tuple(cond_children), span=_span(cond_node)
-                )
+            if cond_children:
+                condition = _as_body(cond_children, _span(cond_node))
 
     if body_node:
         body_children = _normalize_children(body_node, source, diagnostics)
-        if len(body_children) == 1:
-            body = body_children[0]
-        elif body_children:
-            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+        if body_children:
+            body = _as_body(body_children, _span(body_node))
 
     return condition, body
 
@@ -1493,10 +1385,8 @@ def _normalize_c_style_for(
     body_node = node.child_by_field_name("body")
     if body_node:
         body_children = _normalize_children(body_node, source, diagnostics)
-        if len(body_children) == 1:
-            body = body_children[0]
-        elif body_children:
-            body = Sequence(commands=tuple(body_children), span=_span(body_node))
+        if body_children:
+            body = _as_body(body_children, _span(body_node))
 
     return CStyleForLoop(
         init=init, condition=condition, update=update, body=body, span=_span(node)
@@ -1533,17 +1423,10 @@ def _normalize_case_statement(
                     # Pattern: word, extglob_pattern, string, etc.
                     patterns.append(_normalize_word_node(item_child, source))
                 else:
-                    try:
-                        n = _normalize_node(item_child, source, diagnostics)
-                        if n is not None:
-                            body_parts.append(n)
-                    except UnsupportedSyntaxError:
-                        pass
-            item_body: ASTNode | None = None
-            if len(body_parts) == 1:
-                item_body = body_parts[0]
-            elif body_parts:
-                item_body = Sequence(commands=tuple(body_parts), span=_span(child))
+                    _try_normalize_node(item_child, source, diagnostics, body_parts)
+            item_body: ASTNode | None = (
+                _as_body(body_parts, _span(child)) if body_parts else None
+            )
             items.append(
                 CaseItem(
                     patterns=tuple(patterns),
@@ -1564,7 +1447,7 @@ def _normalize_test_command(
     text = _node_text(node, source)
     if text.startswith("[["):
         words: list[Word] = []
-        _flatten_extended_test_children(node, source, words)
+        _flatten_test_children(node, source, words, extended=True)
         return ExtendedTest(words=tuple(words), span=_span(node))
 
     words = []
@@ -1577,21 +1460,42 @@ def _normalize_test_command(
     )
 
 
-def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
-    """Recursively flatten test_command children into a word list."""
+def _flatten_test_children(
+    node: Node, source: str, words: list[Word], *, extended: bool = False
+) -> None:
+    """Recursively flatten test_command children into a word list.
+
+    When *extended* is ``True`` (``[[ ... ]]``):
+    - Only ``[[`` / ``]]`` are treated as bracket tokens.
+    - ``parenthesized_expression`` children are recursed into.
+    - ``(`` and ``)`` are preserved in unnamed children.
+
+    When *extended* is ``False`` (``[ ... ]``):
+    - ``[``, ``]``, ``[[``, and ``]]`` are all treated as bracket tokens.
+    - ``parenthesized_expression`` is not recursed.
+    - ``(`` and ``)`` are filtered out from unnamed children.
+    """
+    bracket_types = ("[[", "]]") if extended else ("[", "]", "[[", "]]")
+    recurse_types: tuple[str, ...] = (
+        ("unary_expression", "binary_expression", "parenthesized_expression")
+        if extended
+        else ("unary_expression", "binary_expression")
+    )
+    unnamed_exclude = ("", " ") if extended else ("", " ", "(", ")")
+
     for child in node.children:
         ctype = child.type
         text = _node_text(child, source)
 
-        if ctype in ("[", "]", "[[", "]]") or ctype == "test_operator":
+        if ctype in bracket_types or ctype == "test_operator":
             words.append(
                 Word(
                     segments=(LiteralSegment(value=text),),
                     span=_span(child),
                 )
             )
-        elif ctype in ("unary_expression", "binary_expression"):
-            _flatten_test_children(child, source, words)
+        elif ctype in recurse_types:
+            _flatten_test_children(child, source, words, extended=extended)
         elif ctype in ("number", "regex"):
             words.append(
                 Word(
@@ -1601,45 +1505,7 @@ def _flatten_test_children(node: Node, source: str, words: list[Word]) -> None:
             )
         elif child.is_named:
             words.append(_normalize_word_node(child, source))
-        elif text not in ("", " ", "(", ")"):
-            words.append(
-                Word(
-                    segments=(LiteralSegment(value=text),),
-                    span=_span(child),
-                )
-            )
-
-
-def _flatten_extended_test_children(node: Node, source: str, words: list[Word]) -> None:
-    """Recursively flatten [[ ... ]] children into a word list, preserving ( and )."""
-    for child in node.children:
-        ctype = child.type
-        text = _node_text(child, source)
-
-        if ctype in ("[[", "]]") or ctype == "test_operator":
-            words.append(
-                Word(
-                    segments=(LiteralSegment(value=text),),
-                    span=_span(child),
-                )
-            )
-        elif ctype in (
-            "unary_expression",
-            "binary_expression",
-            "parenthesized_expression",
-        ):
-            _flatten_extended_test_children(child, source, words)
-        elif ctype in ("number", "regex"):
-            words.append(
-                Word(
-                    segments=(LiteralSegment(value=text),),
-                    span=_span(child),
-                )
-            )
-        elif child.is_named:
-            words.append(_normalize_word_node(child, source))
-        elif text not in ("", " "):
-            # Include ( and ) for grouping in [[ ]]
+        elif text not in unnamed_exclude:
             words.append(
                 Word(
                     segments=(LiteralSegment(value=text),),
