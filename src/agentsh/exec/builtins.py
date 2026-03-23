@@ -26,20 +26,111 @@ BuiltinFn = Callable[
 def builtin_echo(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
-    """Implement echo builtin."""
-    # Handle -n flag (no trailing newline)
+    """Implement echo builtin.
+
+    Flags:
+      -n  Do not output trailing newline
+      -e  Enable interpretation of backslash escapes
+      -E  Disable interpretation of backslash escapes (default)
+    Flags can be combined (e.g. ``-ne``).  Processing stops at the first
+    argument that is not a recognised flag string.
+    """
     no_newline = False
-    output_args = args
+    enable_escapes = False
+    i = 0
 
-    if args and args[0] == "-n":
-        no_newline = True
-        output_args = args[1:]
+    # Parse leading flag arguments.  In bash, echo accepts combined flags
+    # like ``-neE`` and stops at the first non-flag argument.
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-") and len(arg) > 1 and all(c in "neE" for c in arg[1:]):
+            for ch in arg[1:]:
+                if ch == "n":
+                    no_newline = True
+                elif ch == "e":
+                    enable_escapes = True
+                elif ch == "E":
+                    enable_escapes = False
+            i += 1
+        else:
+            break
 
-    text = " ".join(output_args)
+    text = " ".join(args[i:])
+    if enable_escapes:
+        text = _echo_escape(text)
     if not no_newline:
         text += "\n"
     io.stdout.write(text)
     return CommandResult(exit_code=0)
+
+
+_ECHO_ESCAPES: dict[str, str] = {
+    "\\": "\\",
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+}
+
+
+def _echo_escape(text: str) -> str:
+    """Interpret backslash escape sequences for ``echo -e``.
+
+    Supported: ``\\\\``, ``\\a``, ``\\b``, ``\\c`` (stop output),
+    ``\\e`` / ``\\E`` (ESC), ``\\f``, ``\\n``, ``\\r``, ``\\t``, ``\\v``,
+    ``\\0NNN`` (octal), ``\\xHH`` (hex).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "\\" or i + 1 >= n:
+            out.append(text[i])
+            i += 1
+            continue
+        nxt = text[i + 1]
+        if nxt == "c":
+            break  # \c — stop further output
+        if nxt in _ECHO_ESCAPES:
+            out.append(_ECHO_ESCAPES[nxt])
+            i += 2
+        elif nxt == "0":
+            ch, i = _echo_parse_octal(text, i, n)
+            out.append(ch)
+        elif nxt == "x":
+            ch, i = _echo_parse_hex(text, i, n)
+            out.append(ch)
+        else:
+            out.append("\\" + nxt)
+            i += 2
+    return "".join(out)
+
+
+def _echo_parse_octal(text: str, i: int, n: int) -> tuple[str, int]:
+    """Parse ``\\0NNN`` octal escape for echo starting at backslash position *i*."""
+    end = i + 2
+    while end < min(i + 5, n) and text[end] in "01234567":
+        end += 1
+    octal_str = text[i + 2 : end]
+    if octal_str:
+        return chr(int(octal_str, 8) & 0xFF), end
+    return "\0", end
+
+
+def _echo_parse_hex(text: str, i: int, n: int) -> tuple[str, int]:
+    """Parse ``\\xHH`` hex escape for echo starting at backslash position *i*."""
+    end = i + 2
+    while end < min(i + 4, n) and text[end] in "0123456789abcdefABCDEF":
+        end += 1
+    hex_str = text[i + 2 : end]
+    if hex_str:
+        return chr(int(hex_str, 16)), end
+    return "\\x", end
 
 
 def builtin_printf(
@@ -706,6 +797,58 @@ class ReturnSignal(Exception):
         super().__init__()
 
 
+class BreakSignal(Exception):
+    """Signal to break out of a loop.
+
+    *levels* indicates how many enclosing loops to break out of (default 1).
+    """
+
+    def __init__(self, levels: int = 1) -> None:
+        self.levels = levels
+        super().__init__()
+
+
+class ContinueSignal(Exception):
+    """Signal to continue to the next iteration of a loop.
+
+    *levels* indicates how many enclosing loops to skip to (default 1).
+    """
+
+    def __init__(self, levels: int = 1) -> None:
+        self.levels = levels
+        super().__init__()
+
+
+def builtin_break(
+    args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
+) -> CommandResult:
+    """Implement break builtin."""
+    levels = 1
+    if args:
+        try:
+            levels = int(args[0])
+        except ValueError:
+            io.stderr.write(f"break: {args[0]}: numeric argument required\n")
+            return CommandResult(exit_code=1)
+    levels = max(levels, 1)
+    raise BreakSignal(levels)
+
+
+def builtin_continue(
+    args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
+) -> CommandResult:
+    """Implement continue builtin."""
+    levels = 1
+    if args:
+        try:
+            levels = int(args[0])
+        except ValueError:
+            io.stderr.write(f"continue: {args[0]}: numeric argument required\n")
+            return CommandResult(exit_code=1)
+    levels = max(levels, 1)
+    raise ContinueSignal(levels)
+
+
 def builtin_set(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
@@ -1101,6 +1244,8 @@ _BUILTIN_HELP: dict[str, str] = {
     "read": "read [NAME ...] — read a line from stdin",
     "shift": "shift [N] — shift positional parameters",
     "return": "return [N] — return from a function",
+    "break": "break [N] — exit from a for, while, or until loop",
+    "continue": "continue [N] — resume next iteration of a for, while, or until loop",
     "set": "set [option ...] [-- arg ...] — set shell options and positional params",
     "local": "local [NAME=VALUE ...] — define local variables",
     "declare": "declare [NAME=VALUE ...] — declare variables",
@@ -1371,6 +1516,8 @@ BUILTINS: dict[str, BuiltinFn] = {
     "read": builtin_read,
     "shift": builtin_shift,
     "return": builtin_return,
+    "break": builtin_break,
+    "continue": builtin_continue,
     "set": builtin_set,
     "local": builtin_local,
     "declare": builtin_declare,

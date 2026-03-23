@@ -40,6 +40,8 @@ _SHELL_BUILTINS: frozenset[str] = frozenset(
         "read",
         "shift",
         "return",
+        "break",
+        "continue",
         "local",
         "declare",
         "set",

@@ -29,6 +29,7 @@ from agentsh.ast.nodes import (
     IfClause,
     Pipeline,
     Program,
+    RedirectedCommand,
     Sequence,
     SimpleCommand,
     Subshell,
@@ -36,7 +37,7 @@ from agentsh.ast.nodes import (
     WhileLoop,
 )
 from agentsh.commands._registry import COMMANDS
-from agentsh.exec.builtins import BUILTINS
+from agentsh.exec.builtins import BUILTINS, BreakSignal, ContinueSignal
 from agentsh.exec.compound import (
     execute_and_or,
     execute_function_call,
@@ -127,6 +128,8 @@ class CommandEvaluator:
                 return self._execute_case(node, io)
             case ExtendedTest():
                 return self._execute_extended_test(node, io)
+            case RedirectedCommand():
+                return self._execute_redirected_command(node, io)
             case _:
                 io.stderr.write(
                     f"agentsh: unsupported node type: {type(node).__name__}\n"
@@ -363,7 +366,20 @@ class CommandEvaluator:
             cond_result = self.execute_node(node.condition, io)
             if (cond_result.exit_code == 0) == break_on_success:
                 break
-            result = self.execute_node(node.body, io)
+            try:
+                result = self.execute_node(node.body, io)
+            except BreakSignal as sig:
+                if sig.levels > 1:
+                    raise BreakSignal(sig.levels - 1) from None
+                break
+            except ContinueSignal as sig:
+                if sig.levels > 1:
+                    raise ContinueSignal(sig.levels - 1) from None
+                iterations += 1
+                if iterations > max_iter:
+                    io.stderr.write("agentsh: loop iteration limit reached\n")
+                    break
+                continue
             iterations += 1
             if iterations > max_iter:
                 io.stderr.write("agentsh: loop iteration limit reached\n")
@@ -382,7 +398,16 @@ class CommandEvaluator:
 
         for item in items:
             self.state.set_var(node.variable, item)
-            result = self.execute_node(node.body, io)
+            try:
+                result = self.execute_node(node.body, io)
+            except BreakSignal as sig:
+                if sig.levels > 1:
+                    raise BreakSignal(sig.levels - 1) from None
+                break
+            except ContinueSignal as sig:
+                if sig.levels > 1:
+                    raise ContinueSignal(sig.levels - 1) from None
+                continue
             if self.state.options.errexit and result.exit_code != 0:
                 break
         return result
@@ -435,7 +460,25 @@ class CommandEvaluator:
                 cond_val = self.arith_ev.eval_expr(node.condition)
                 if cond_val == 0:
                     break
-            result = self.execute_node(node.body, io)
+            try:
+                result = self.execute_node(node.body, io)
+            except BreakSignal as sig:
+                if sig.levels > 1:
+                    raise BreakSignal(sig.levels - 1) from None
+                break
+            except ContinueSignal as sig:
+                if sig.levels > 1:
+                    raise ContinueSignal(sig.levels - 1) from None
+                iterations += 1
+                if iterations > max_iter:
+                    io.stderr.write(
+                        "agentsh: C-style for loop iteration limit reached\n"
+                    )
+                    break
+                # Evaluate update before continuing
+                if node.update:
+                    self.arith_ev.eval_statement(node.update)
+                continue
             iterations += 1
             if iterations > max_iter:
                 io.stderr.write("agentsh: C-style for loop iteration limit reached\n")
@@ -443,6 +486,33 @@ class CommandEvaluator:
             # Evaluate update
             if node.update:
                 self.arith_ev.eval_statement(node.update)
+        return result
+
+    # ------------------------------------------------------------------
+    # Redirected compound command
+    # ------------------------------------------------------------------
+
+    def _execute_redirected_command(
+        self, node: RedirectedCommand, io: IOContext
+    ) -> CommandResult:
+        """Execute a compound command with I/O redirections applied."""
+        saved_stdin = io.stdin
+        saved_stdout = io.stdout
+        saved_stderr = io.stderr
+        io = apply_redirections(
+            node.redirections, io, self.state, self.vfs, self.cmdsub_hook
+        )
+        result = self.execute_node(node.body, io)
+        # Flush VFS write buffers
+        if isinstance(io.stdout, VFSWriteBuffer):
+            io.stdout.flush_to_vfs()
+        if isinstance(io.stderr, VFSWriteBuffer):
+            io.stderr.flush_to_vfs()
+        # Restore original streams
+        io.stdin = saved_stdin
+        io.stdout = saved_stdout
+        io.stderr = saved_stderr
+        self.state.last_status = result.exit_code
         return result
 
     # ------------------------------------------------------------------

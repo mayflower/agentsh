@@ -283,3 +283,18 @@ class CaseItem:
     patterns: tuple[Word, ...]
     body: ASTNode | None
     span: Span
+
+
+@dataclass(frozen=True, slots=True)
+class RedirectedCommand:
+    """A compound command wrapped with I/O redirections.
+
+    Produced by ``redirected_statement`` when the inner command is
+    *not* a :class:`SimpleCommand` (e.g. ``while``, ``for``, ``if``).
+    ``SimpleCommand`` already carries its own ``redirections`` field,
+    so it does not need this wrapper.
+    """
+
+    body: ASTNode
+    redirections: tuple[Redirection, ...]
+    span: Span

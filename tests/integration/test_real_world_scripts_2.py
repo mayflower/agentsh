@@ -111,7 +111,8 @@ class TestRealWorldScripts2:
     # 14: Parallel Job Runner
     #   Uses: declare -A/a, IFS='|' splitting, case statement, printf,
     #         nested while loops with arithmetic
-    #   Result: runs but associative arrays are empty so 0 jobs processed
+    #   Result: runs; heredoc while-read processes the last entry so
+    #           1 job is found and executed
     # ------------------------------------------------------------------
     def test_14_parallel_job_runner(self) -> None:
         engine = ShellEngine()
@@ -119,11 +120,11 @@ class TestRealWorldScripts2:
         result = engine.run(script)
         assert result.result.exit_code == 0
         assert "=== Parallel Job Runner ===" in result.stdout
-        assert "Jobs: 0, Max concurrent: 3" in result.stdout
+        assert "Jobs: 1, Max concurrent: 3" in result.stdout
         assert "=== Summary ===" in result.stdout
-        assert "Total: 0" in result.stdout
-        assert "Success rate: 0%" in result.stdout
-        assert "Batches: 0" in result.stdout
+        assert "Total: 1" in result.stdout
+        assert "Passed: 1" in result.stdout
+        assert "Batches: 1" in result.stdout
 
     # ------------------------------------------------------------------
     # 15: Dockerfile Linter
@@ -162,8 +163,8 @@ class TestRealWorldScripts2:
     # 16: API Response Time SLA
     #   Uses: sort -n pipeline, indexed arrays, compute_sum/percentile
     #         functions, printf formatting, associative array for buckets
-    #   Result: runs but arrays/sort not fully working, 0 requests;
-    #           printf format strings not interpolated
+    #   Result: runs; heredoc while-read processes the last entry so
+    #           1 request is parsed; SLA checks run against it
     # ------------------------------------------------------------------
     def test_16_api_response_time_sla(self) -> None:
         engine = ShellEngine()
@@ -171,7 +172,7 @@ class TestRealWorldScripts2:
         result = engine.run(script)
         assert result.result.exit_code == 0
         assert "=== API Response Time SLA Report ===" in result.stdout
-        assert "Sample size: 0 requests" in result.stdout
+        assert "Sample size: 1 requests" in result.stdout
         assert "--- Latency Distribution ---" in result.stdout
         assert "--- Histogram ---" in result.stdout
         assert "--- SLA Compliance ---" in result.stdout
@@ -181,8 +182,8 @@ class TestRealWorldScripts2:
     # 17: Cron Schedule Validator
     #   Uses: parse_cron_field function with BASH_REMATCH, seq for loops,
     #         associative array HOUR_LOAD, conflict detection with nested loops
-    #   Result: runs but cron entries not parsed (0 jobs), printf not
-    #           interpolated; structure output present
+    #   Result: runs; heredoc while-read processes the last cron entry
+    #           (1 job); structure output present
     # ------------------------------------------------------------------
     def test_17_cron_schedule_validator(self) -> None:
         engine = ShellEngine()
@@ -191,7 +192,7 @@ class TestRealWorldScripts2:
         assert result.result.exit_code == 0
         assert "=== Crontab Audit Report ===" in result.stdout
         assert "--- Schedule Analysis ---" in result.stdout
-        assert "Total jobs: 0" in result.stdout
+        assert "Total jobs: 1" in result.stdout
         assert "--- Hourly Load Distribution ---" in result.stdout
         assert "--- Conflict Detection ---" in result.stdout
         assert "No exact schedule conflicts found" in result.stdout

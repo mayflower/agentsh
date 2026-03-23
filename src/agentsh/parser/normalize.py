@@ -26,6 +26,7 @@ from agentsh.ast.nodes import (
     IfClause,
     Pipeline,
     Program,
+    RedirectedCommand,
     Redirection,
     Sequence,
     SimpleCommand,
@@ -806,10 +807,15 @@ def _normalize_declaration_command(
                             span=_span(child),
                         )
                     )
-                else:
+                elif value_node is not None:
+                    # Normalize the value node to preserve expansions
+                    # (e.g. local x="$1" must expand $1).
+                    value_segments = _extract_segments(value_node, source)
+                    all_segs: list[WordSegment] = [LiteralSegment(value=f"{name}=")]
+                    all_segs.extend(value_segments)
                     words.append(
                         Word(
-                            segments=(LiteralSegment(value=f"{name}={val_part}"),),
+                            segments=tuple(all_segs),
                             span=_span(child),
                         )
                     )
@@ -876,6 +882,15 @@ def _normalize_redirected_statement(
                 words=inner.words,
                 assignments=inner.assignments,
                 redirections=inner.redirections + tuple(extra_redirs),
+                span=_span(node),
+            )
+        if redirect_nodes and inner is not None:
+            extra_redirs = [
+                _normalize_redirection(r, source, diagnostics) for r in redirect_nodes
+            ]
+            return RedirectedCommand(
+                body=inner,
+                redirections=tuple(extra_redirs),
                 span=_span(node),
             )
         return inner  # type: ignore[return-value]
@@ -1004,49 +1019,65 @@ def _extract_simple_expansion(node: Node, source: str) -> tuple[str, str]:
     return "", full_text.lstrip("$")
 
 
+def _extract_dq_child(child: Node, source: str, out: list[WordSegment]) -> None:
+    """Dispatch a single child node inside a double-quoted string."""
+    if not child.is_named:
+        text = _node_text(child, source)
+        if text not in ('"',):
+            out.append(LiteralSegment(value=text))
+    elif child.type == "string_content":
+        out.append(LiteralSegment(value=_node_text(child, source)))
+    elif child.type == "simple_expansion":
+        prefix, var_name = _extract_simple_expansion(child, source)
+        if prefix:
+            out.append(LiteralSegment(value=prefix))
+        out.append(ParameterExpansionSegment(name=var_name))
+    elif child.type == "expansion":
+        full_text = _node_text(child, source)
+        brace_idx = full_text.find("${")
+        if brace_idx > 0:
+            out.append(LiteralSegment(value=full_text[:brace_idx]))
+        out.append(_parse_expansion(child, source))
+    elif child.type == "command_substitution":
+        text = _node_text(child, source)
+        if text.startswith("$(") and text.endswith(")"):
+            cmd = text[2:-1]
+        elif text.startswith("`") and text.endswith("`"):
+            cmd = text[1:-1]
+        else:
+            cmd = text
+        out.append(CommandSubstitutionSegment(command=cmd))
+    elif child.type == "arithmetic_expansion":
+        text = _node_text(child, source)
+        expr = text[3:-2] if text.startswith("$((") and text.endswith("))") else text
+        out.append(ArithmeticExpansionSegment(expression=expr))
+    else:
+        out.extend(_extract_segments(child, source))
+
+
 def _extract_double_quoted(node: Node, source: str) -> list[WordSegment]:
-    """Extract segments from a double-quoted string node."""
+    """Extract segments from a double-quoted string node.
+
+    Tracks byte positions to capture any source text that falls between
+    tree-sitter children (e.g. newlines between ``string_content`` nodes
+    in a multiline double-quoted string).
+    """
     segments: list[WordSegment] = []
     inner_segments: list[WordSegment] = []
 
+    # Byte cursor: starts right after the opening quote.
+    cursor = node.start_byte
+
     for child in node.children:
-        if not child.is_named:
-            text = _node_text(child, source)
-            if text not in ('"',):
-                inner_segments.append(LiteralSegment(value=text))
-        elif child.type == "string_content":
-            inner_segments.append(LiteralSegment(value=_node_text(child, source)))
-        elif child.type == "simple_expansion":
-            # Extract leading text before the $ as a literal segment
-            prefix, var_name = _extract_simple_expansion(child, source)
-            if prefix:
-                inner_segments.append(LiteralSegment(value=prefix))
-            inner_segments.append(ParameterExpansionSegment(name=var_name))
-        elif child.type == "expansion":
-            # Handle leading whitespace before ${
-            full_text = _node_text(child, source)
-            brace_idx = full_text.find("${")
-            if brace_idx > 0:
-                inner_segments.append(LiteralSegment(value=full_text[:brace_idx]))
-            inner_segments.append(_parse_expansion(child, source))
-        elif child.type == "command_substitution":
-            text = _node_text(child, source)
-            if text.startswith("$(") and text.endswith(")"):
-                cmd = text[2:-1]
-            elif text.startswith("`") and text.endswith("`"):
-                cmd = text[1:-1]
-            else:
-                cmd = text
-            inner_segments.append(CommandSubstitutionSegment(command=cmd))
-        elif child.type == "arithmetic_expansion":
-            text = _node_text(child, source)
-            if text.startswith("$((") and text.endswith("))"):
-                expr = text[3:-2]
-            else:
-                expr = text
-            inner_segments.append(ArithmeticExpansionSegment(expression=expr))
-        else:
-            inner_segments.extend(_extract_segments(child, source))
+        # Capture any gap text between the previous child and this one.
+        if child.start_byte > cursor:
+            gap = source[cursor : child.start_byte]
+            # Skip the opening/closing quote characters themselves.
+            if gap and gap != '"':
+                inner_segments.append(LiteralSegment(value=gap))
+
+        _extract_dq_child(child, source, inner_segments)
+        cursor = child.end_byte
 
     # Always create a DoubleQuotedSegment, even for empty strings like ""
     segments.append(DoubleQuotedSegment(segments=tuple(inner_segments)))
