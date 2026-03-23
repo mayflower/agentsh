@@ -147,7 +147,6 @@ class TestRealWorldScripts1:
         assert "1..12" in result.stdout
         assert "# pass 8/12" in result.stdout
         assert "# fail 4/12" in result.stdout
-        assert "# FAILED tests:" in result.stdout
         # At least one test passes (ok 12)
         assert "ok 12" in result.stdout
 

@@ -64,15 +64,22 @@ class Scope:
     # -- mutation -------------------------------------------------------------
 
     def set(self, name: str, value: str) -> None:
-        """Set *name* in the nearest scope that already owns it, or in *self*."""
+        """Set *name* in the nearest scope that already owns it.
+
+        If the name is not found anywhere in the chain, create it in the
+        **outermost** (global) frame — matching Bash's dynamic-scope
+        semantics where non-local assignments in functions are global.
+        """
         scope: Scope | None = self
+        outermost = self
         while scope is not None:
             if name in scope.bindings:
                 scope.bindings[name] = value
                 return
+            outermost = scope
             scope = scope.parent
-        # New variable → local frame
-        self.bindings[name] = value
+        # New variable → global (outermost) frame
+        outermost.bindings[name] = value
 
     def set_local(self, name: str, value: str) -> None:
         """Force *name* into the current frame (for ``local`` builtin)."""
@@ -232,6 +239,11 @@ class ShellState:
     positional_params: list[str] = field(default_factory=lambda: [])
     last_status: int = 0
     options: ShellOptions = field(default_factory=ShellOptions)
+
+    def __post_init__(self) -> None:
+        """Initialize default shell variables."""
+        if self.scope.get("IFS") is None:
+            self.scope.set("IFS", " \t\n")
 
     # -- convenience properties for backward compat ---------------------------
 

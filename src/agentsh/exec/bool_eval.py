@@ -39,6 +39,10 @@ class BoolEvaluator:
         if not args:
             return False
 
+        # Handle leading negation at any length
+        if args[0] == "!" and len(args) > 1:
+            return not self.eval_test(args[1:])
+
         if len(args) == 1:
             return len(args[0]) > 0
 
@@ -47,9 +51,6 @@ class BoolEvaluator:
 
         if len(args) == 3:
             return self._eval_binary(args[0], args[1], args[2])
-
-        if len(args) == 4 and args[0] == "!":
-            return not self.eval_test(args[1:])
 
         return False
 

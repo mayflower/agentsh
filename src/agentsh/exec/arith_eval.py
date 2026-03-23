@@ -34,8 +34,8 @@ class ArithEvaluator:
         On any parse/evaluation error the result is ``0``.
         """
         expr = self._expand_braced_expansions(expression)
-        expr = self._substitute_variables(expr)
         expr = self._preprocess(expr)
+        expr = self._substitute_variables(expr)
 
         try:
             tree = ast.parse(expr.strip(), mode="eval")

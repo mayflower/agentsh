@@ -24,8 +24,8 @@ class TestDefaults:
     def test_default_cwd(self, state: ShellState) -> None:
         assert state.cwd == "/"
 
-    def test_default_variables_empty(self, state: ShellState) -> None:
-        assert state.variables == {}
+    def test_default_variables_has_ifs(self, state: ShellState) -> None:
+        assert state.variables == {"IFS": " \t\n"}
 
     def test_default_exported_env_empty(self, state: ShellState) -> None:
         assert state.exported_env == {}
@@ -127,9 +127,19 @@ class TestScope:
         state.pop_scope()
         assert state.get_var("X") == "outer"
 
-    def test_new_var_in_child_scope(self, state: ShellState) -> None:
+    def test_new_var_in_child_scope_is_global(self, state: ShellState) -> None:
+        """New variables set via set_var in a child scope go to the global frame."""
         state.push_scope()
-        state.set_var("LOCAL", "val")
+        state.set_var("GLOBAL_VAR", "val")
+        assert state.get_var("GLOBAL_VAR") == "val"
+        state.pop_scope()
+        # Variable persists in the global frame (bash dynamic scope)
+        assert state.get_var("GLOBAL_VAR") == "val"
+
+    def test_local_var_in_child_scope(self, state: ShellState) -> None:
+        """Variables set via set_local are scoped to the child frame."""
+        state.push_scope()
+        state.scope.set_local("LOCAL", "val")
         assert state.get_var("LOCAL") == "val"
         state.pop_scope()
         assert state.get_var("LOCAL") is None

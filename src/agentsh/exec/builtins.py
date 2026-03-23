@@ -898,14 +898,14 @@ def _apply_set_o(state: ShellState, opt: str, enable: bool) -> None:
 def builtin_local(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
-    """Implement local builtin (simplified — just sets variables)."""
+    """Implement local builtin — creates variables in the current scope frame."""
     for arg in args:
         if "=" in arg:
             name, value = arg.split("=", 1)
-            state.set_var(name, value)
-        # Declare without value
-        elif state.get_var(arg) is None:
-            state.set_var(arg, "")
+            state.scope.set_local(name, value)
+        else:
+            # Declare without value — create in current frame
+            state.scope.set_local(arg, state.get_var(arg) or "")
     return CommandResult(exit_code=0)
 
 
@@ -1127,7 +1127,7 @@ def builtin_let(
 
     last_result = 0
     for expr in args:
-        last_result = arith.eval_expr(expr)
+        last_result = arith.eval_statement(expr)
 
     # let returns 0 if last result is non-zero, 1 if zero
     return CommandResult(exit_code=0 if last_result != 0 else 1)

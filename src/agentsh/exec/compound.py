@@ -103,7 +103,7 @@ def execute_function_call(
     executor: Executor | CommandEvaluator,
     io: IOContext,
 ) -> CommandResult:
-    """Execute a function call with positional parameter setup."""
+    """Execute a function call with positional parameter setup and local scope."""
     from agentsh.exec.builtins import ReturnSignal
 
     func_def = executor.state.functions.get(name)
@@ -115,11 +115,15 @@ def execute_function_call(
     saved_params = executor.state.positional_params
     executor.state.positional_params = args
 
+    # Push a new scope for local variables
+    executor.state.push_scope()
+
     try:
         result = executor.execute_node(func_def.body, io)
     except ReturnSignal as ret:
         result = CommandResult(exit_code=ret.exit_code)
     finally:
+        executor.state.pop_scope()
         executor.state.positional_params = saved_params
 
     return result
