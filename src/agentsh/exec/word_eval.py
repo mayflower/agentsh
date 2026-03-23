@@ -184,17 +184,30 @@ class WordEvaluator:
                 pass  # fall through to variable lookup
 
         # Array expansion operators
+        array_result = self._try_expand_array_operator(seg)
+        if array_result is not None:
+            return array_result
+
+        value = self.state.get_var(name)
+
+        if seg.operator is None:
+            return _ExpandedPart(text=value or "", quoted=False)
+
+        return self._apply_parameter_operator(name, value, seg.operator, seg.argument)
+
+    def _try_expand_array_operator(
+        self, seg: ParameterExpansionSegment
+    ) -> _ExpandedPart | None:
+        """Handle array-related operators, returning None if not applicable."""
+        name = seg.name
         if seg.operator == "[":
             return self._expand_array_subscript(name, seg.argument or "0")
+        if seg.operator == "![@]":
+            return self._expand_array_keys(name)
         if seg.operator == "#[":
-            # ${#arr[@]} — array length
-            arr = self.state.get_array(name)
-            if arr is not None:
-                return _ExpandedPart(text=str(len(arr)), quoted=False)
-            return _ExpandedPart(text="0", quoted=False)
+            return self._expand_array_length(name)
         # ${arr[subscript]op...} — array element with further operator
         if seg.operator and seg.operator.startswith("["):
-            # Parse [subscript]op
             bracket_end = seg.operator.find("]")
             if bracket_end >= 0:
                 subscript = seg.operator[1:bracket_end]
@@ -205,13 +218,30 @@ class WordEvaluator:
                         name, elem_part.text, remaining_op, seg.argument
                     )
                 return elem_part
+        return None
 
-        value = self.state.get_var(name)
+    def _expand_array_keys(self, name: str) -> _ExpandedPart:
+        """Expand ``${!name[@]}`` — return space-joined array keys."""
+        assoc = self.state.get_assoc(name)
+        if assoc is not None:
+            return _ExpandedPart(text=" ".join(assoc.keys()), quoted=False)
+        arr = self.state.get_array(name)
+        if arr is not None:
+            return _ExpandedPart(
+                text=" ".join(str(i) for i in range(len(arr))),
+                quoted=False,
+            )
+        return _ExpandedPart(text="", quoted=False)
 
-        if seg.operator is None:
-            return _ExpandedPart(text=value or "", quoted=False)
-
-        return self._apply_parameter_operator(name, value, seg.operator, seg.argument)
+    def _expand_array_length(self, name: str) -> _ExpandedPart:
+        """Expand ``${#arr[@]}`` — return array length as string."""
+        assoc = self.state.get_assoc(name)
+        if assoc is not None:
+            return _ExpandedPart(text=str(len(assoc)), quoted=False)
+        arr = self.state.get_array(name)
+        if arr is not None:
+            return _ExpandedPart(text=str(len(arr)), quoted=False)
+        return _ExpandedPart(text="0", quoted=False)
 
     def _apply_parameter_operator(  # noqa: C901
         self,
@@ -361,6 +391,15 @@ class WordEvaluator:
 
     def _expand_array_subscript(self, name: str, subscript: str) -> _ExpandedPart:
         """Expand ${arr[subscript]}."""
+        # Check associative array first
+        assoc = self.state.get_assoc(name)
+        if assoc is not None:
+            if subscript in ("@", "*"):
+                return _ExpandedPart(text=" ".join(assoc.values()), quoted=False)
+            # Expand variables in subscript (e.g. $key → its value)
+            expanded_key = self._expand_arg_string(subscript)
+            return _ExpandedPart(text=assoc.get(expanded_key, ""), quoted=False)
+
         arr = self.state.get_array(name)
         if subscript in ("@", "*"):
             if arr is not None:

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from agentsh.ast.nodes import (
     AndOrList,
     ArrayAssignmentWord,
+    AssignmentWord,
     ASTNode,
     CaseClause,
     CStyleForLoop,
@@ -198,20 +199,7 @@ class CommandEvaluator:
                     values.extend(self.word_ev.eval_word(val_word))
                 self.state.set_array(assign.name, values)
                 continue
-            # Check for subscript assignment: name[idx]=value
-            aname = assign.name
-            if "[" in aname and aname.endswith("]"):
-                bracket = aname.index("[")
-                base = aname[:bracket]
-                idx_str = aname[bracket + 1 : -1]
-                try:
-                    idx = int(idx_str)
-                except ValueError:
-                    idx = self.arith_ev.eval_expr(idx_str)
-                value = ""
-                if assign.value is not None:
-                    value = self.word_ev.eval_word_single(assign.value)
-                self.state.set_array_element(base, idx, value)
+            if self._handle_subscript_assignment(assign):
                 continue
             value = ""
             if assign.value is not None:
@@ -288,6 +276,32 @@ class CommandEvaluator:
         self._restore_vars_if_temporary(node, saved_vars)
         self.state.last_status = result.exit_code
         return result
+
+    def _handle_subscript_assignment(self, assign: AssignmentWord) -> bool:
+        """Handle ``name[subscript]=value`` assignments.
+
+        Returns ``True`` if this was a subscript assignment (handled),
+        ``False`` otherwise.
+        """
+        aname = assign.name
+        if "[" not in aname or not aname.endswith("]"):
+            return False
+        bracket = aname.index("[")
+        base = aname[:bracket]
+        idx_str = aname[bracket + 1 : -1]
+        value = ""
+        if assign.value is not None:
+            value = self.word_ev.eval_word_single(assign.value)
+        # If the variable is an associative array, use string key
+        if self.state.get_assoc(base) is not None:
+            self.state.set_assoc_element(base, idx_str, value)
+        else:
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                idx = self.arith_ev.eval_expr(idx_str)
+            self.state.set_array_element(base, idx, value)
+        return True
 
     def _dispatch_builtin(
         self, cmd_name: str, cmd_args: list[str], io: IOContext

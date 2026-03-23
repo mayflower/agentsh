@@ -670,15 +670,15 @@ class TestBuiltinPrintf:
         builtin_printf(["%d", "-7"], state, vfs, io)
         assert io.stdout.getvalue() == "-7"
 
-    def test_extra_args_ignored(
+    def test_extra_args_cycle(
         self,
         state: ShellState,
         vfs: VirtualFilesystem,
     ) -> None:
-        """Extra args beyond format placeholders are ignored."""
+        """Extra args cause the format string to be re-applied (cycling)."""
         io = IOContext()
-        builtin_printf(["%s", "used", "ignored"], state, vfs, io)
-        assert io.stdout.getvalue() == "used"
+        builtin_printf(["%s", "used", "again"], state, vfs, io)
+        assert io.stdout.getvalue() == "usedagain"
 
 
 # ==================================================================

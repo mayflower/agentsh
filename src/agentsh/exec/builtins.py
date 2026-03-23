@@ -6,6 +6,7 @@ All filesystem interactions go through VFS.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -44,59 +45,255 @@ def builtin_echo(
 def builtin_printf(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
-    """Implement printf builtin (simplified)."""
+    """Implement printf builtin with full format string support.
+
+    Supports format specifiers: ``%[-0 +]?[width|*]?[.precision|.*]?[sdixXofc%]``
+    Escape sequences: ``\\n \\t \\\\ \\\" \\xNN \\0NNN``
+    Cycles through format string when extra arguments remain.
+    """
     if not args:
         return CommandResult(exit_code=0)
 
     fmt = args[0]
     fmt_args = args[1:]
 
-    # Simple format string handling
-    result = _simple_printf(fmt, fmt_args)
+    result = _printf_format(fmt, fmt_args)
     io.stdout.write(result)
     return CommandResult(exit_code=0)
 
 
-def _simple_printf(fmt: str, args: list[str]) -> str:
-    """Simple printf-style formatting."""
-    result = ""
-    arg_idx = 0
+# Regex matching a single printf format specifier:
+#   %[flags][width][.precision]conversion
+# where width/precision can be '*' (take from next arg).
+_FMT_SPEC_RE = re.compile(
+    r"%"
+    r"(?P<flags>[-+ 0#]*)?"
+    r"(?P<width>\*|\d+)?"
+    r"(?:\.(?P<precision>\*|\d+))?"
+    r"(?P<conv>[sdixXofceEgGc%])"
+)
+
+
+_SIMPLE_ESCAPES: dict[str, str] = {
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+}
+
+
+def _parse_hex_escape(text: str, i: int, n: int) -> tuple[str, int]:
+    """Parse ``\\xNN`` hex escape starting at backslash position *i*."""
+    if i + 3 < n:
+        hex_str = text[i + 2 : i + 4]
+        try:
+            return chr(int(hex_str, 16)), i + 4
+        except ValueError:
+            pass
+    return "\\x", i + 2
+
+
+def _parse_octal_escape(text: str, i: int, n: int) -> tuple[str, int]:
+    """Parse ``\\0NNN`` octal escape starting at backslash position *i*."""
+    end = i + 2
+    while end < min(i + 5, n) and text[end] in "01234567":
+        end += 1
+    octal_str = text[i + 2 : end]
+    if octal_str:
+        return chr(int(octal_str, 8) & 0xFF), end
+    return "\0", end
+
+
+def _process_escape_sequences(text: str) -> str:
+    """Expand backslash escape sequences in a printf format string."""
+    out: list[str] = []
     i = 0
-    while i < len(fmt):
-        if fmt[i] == "\\" and i + 1 < len(fmt):
-            escape = fmt[i + 1]
-            if escape == "n":
-                result += "\n"
-            elif escape == "t":
-                result += "\t"
-            elif escape == "\\":
-                result += "\\"
-            elif escape == '"':
-                result += '"'
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in _SIMPLE_ESCAPES:
+                out.append(_SIMPLE_ESCAPES[nxt])
+                i += 2
+            elif nxt == "x":
+                ch, i = _parse_hex_escape(text, i, n)
+                out.append(ch)
+            elif nxt == "0":
+                ch, i = _parse_octal_escape(text, i, n)
+                out.append(ch)
             else:
-                result += "\\" + escape
-            i += 2
-        elif fmt[i] == "%" and i + 1 < len(fmt):
-            spec = fmt[i + 1]
+                out.append("\\" + nxt)
+                i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _coerce_int(arg: str) -> int:
+    """Coerce a string argument to int, bash-style.
+
+    Handles decimal, 0x hex, 0 octal prefixes.  Returns 0 on failure.
+    """
+    if not arg:
+        return 0
+    try:
+        # Handle 0x prefix for hex, 0 prefix for octal
+        if arg.startswith("0x") or arg.startswith("0X"):
+            return int(arg, 16)
+        if arg.startswith("0") and len(arg) > 1 and arg[1:].isdigit():
+            return int(arg, 8)
+        return int(arg)
+    except ValueError:
+        return 0
+
+
+def _coerce_float(arg: str) -> float:
+    """Coerce a string argument to float.  Returns 0.0 on failure."""
+    if not arg:
+        return 0.0
+    try:
+        return float(arg)
+    except ValueError:
+        return 0.0
+
+
+def _printf_format(fmt: str, args: list[str]) -> str:
+    """Full printf-style formatting with arg cycling.
+
+    Processes escape sequences, then iterates over format specifiers.
+    When there are more ``args`` than specifiers consume in one pass,
+    the format string is reused (cycling) until all args are consumed.
+    """
+    expanded = _process_escape_sequences(fmt)
+
+    # If there are no format specifiers at all, just return the expanded text
+    if not _FMT_SPEC_RE.search(expanded):
+        return expanded
+
+    result: list[str] = []
+    arg_idx = 0
+    # Track whether at least one pass has been done
+    first_pass = True
+
+    while first_pass or arg_idx < len(args):
+        first_pass = False
+        pos = 0
+        while pos < len(expanded):
+            m = _FMT_SPEC_RE.search(expanded, pos)
+            if m is None:
+                # Append the rest of the literal text
+                result.append(expanded[pos:])
+                break
+
+            # Append literal text before this specifier
+            result.append(expanded[pos : m.start()])
+
+            conv = m.group("conv")
+
+            # %% is literal '%' and doesn't consume an arg
+            if conv == "%":
+                result.append("%")
+                pos = m.end()
+                continue
+
+            # --- Resolve width ---
+            width_str = m.group("width") or ""
+            if width_str == "*":
+                width_val = str(
+                    _coerce_int(args[arg_idx] if arg_idx < len(args) else "")
+                )
+                arg_idx += 1
+            else:
+                width_val = width_str
+
+            # --- Resolve precision ---
+            precision_str = m.group("precision")
+            if precision_str == "*":
+                precision_val: str | None = str(
+                    _coerce_int(args[arg_idx] if arg_idx < len(args) else "")
+                )
+                arg_idx += 1
+            else:
+                precision_val = precision_str  # may be None
+
+            flags_str = m.group("flags") or ""
+
+            # Consume the next argument for the value
             arg = args[arg_idx] if arg_idx < len(args) else ""
             arg_idx += 1
-            if spec == "s":
-                result += arg
-            elif spec == "d":
-                try:
-                    result += str(int(arg))
-                except ValueError:
-                    result += "0"
-            elif spec == "%":
-                result += "%"
-                arg_idx -= 1  # %% doesn't consume an argument
-            else:
-                result += "%" + spec
-            i += 2
-        else:
-            result += fmt[i]
-            i += 1
-    return result
+
+            # Build a Python %-style format spec and apply it
+            result.append(
+                _apply_format_spec(flags_str, width_val, precision_val, conv, arg)
+            )
+
+            pos = m.end()
+
+    return "".join(result)
+
+
+def _apply_format_spec(
+    flags: str,
+    width: str,
+    precision: str | None,
+    conv: str,
+    arg: str,
+) -> str:
+    """Build a Python ``%``-format string and apply it to *arg*.
+
+    Returns the formatted string.
+    """
+    # Build the %-spec: %[flags][width][.precision]conv
+    spec = "%"
+    spec += flags
+    spec += width
+
+    if precision is not None:
+        spec += "." + precision
+
+    # Map bash conversion letters to Python %-format
+    if conv in ("d", "i"):
+        spec += "d"
+        try:
+            return spec % _coerce_int(arg)
+        except (ValueError, OverflowError):
+            return spec % 0
+    elif conv == "s":
+        spec += "s"
+        return spec % arg
+    elif conv in ("f", "e", "E", "g", "G"):
+        spec += conv
+        try:
+            return spec % _coerce_float(arg)
+        except (ValueError, OverflowError):
+            return spec % 0.0
+    elif conv in ("x", "X"):
+        spec += conv
+        try:
+            return spec % _coerce_int(arg)
+        except (ValueError, OverflowError):
+            return spec % 0
+    elif conv == "o":
+        spec += "o"
+        try:
+            return spec % _coerce_int(arg)
+        except (ValueError, OverflowError):
+            return spec % 0
+    elif conv == "c":
+        # %c prints the first character (or empty if arg is empty)
+        char = arg[0] if arg else "\0"
+        spec += "c"
+        return spec % char
+    else:
+        # Unknown — return the literal spec + arg
+        return "%" + conv
 
 
 def builtin_cd(
@@ -214,26 +411,258 @@ def builtin_test(
     return CommandResult(exit_code=0 if result else 1)
 
 
+class _ReadOpts:
+    """Parsed options for the read builtin."""
+
+    __slots__ = ("array_name", "delimiter", "max_chars", "raw_mode", "var_names")
+
+    def __init__(self) -> None:
+        self.raw_mode: bool = False
+        self.array_name: str | None = None
+        self.delimiter: str = "\n"
+        self.max_chars: int | None = None
+        self.var_names: list[str] = []
+
+
+def _parse_read_opts(args: list[str]) -> _ReadOpts:  # noqa: C901
+    """Parse read builtin flags and variable names from *args*."""
+    opts = _ReadOpts()
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg.startswith("-") or arg in {"-", "--"}:
+            if arg == "--":
+                i += 1
+            opts.var_names.extend(args[i:])
+            break
+
+        # Walk flag characters (handles combined flags like -ra)
+        j = 1
+        while j < len(arg):
+            ch = arg[j]
+            if ch in {"r", "s"}:
+                if ch == "r":
+                    opts.raw_mode = True
+                j += 1
+            elif ch == "a":
+                rest = arg[j + 1 :]
+                if rest:
+                    opts.array_name = rest
+                else:
+                    i += 1
+                    if i < len(args):
+                        opts.array_name = args[i]
+                j = len(arg)
+            elif ch == "d":
+                rest = arg[j + 1 :]
+                if rest:
+                    opts.delimiter = rest[0]
+                else:
+                    i += 1
+                    if i < len(args) and args[i]:
+                        opts.delimiter = args[i][0]
+                j = len(arg)
+            elif ch == "n":
+                rest = arg[j + 1 :]
+                opts.max_chars = _try_int(
+                    rest if rest else (args[i + 1] if i + 1 < len(args) else "")
+                )
+                if not rest:
+                    i += 1
+                j = len(arg)
+            elif ch in {"p", "t"}:
+                # -p PROMPT / -t TIMEOUT: consume argument, no-op
+                if not arg[j + 1 :]:
+                    i += 1
+                j = len(arg)
+            else:
+                j += 1
+        i += 1
+    return opts
+
+
+def _try_int(s: str) -> int | None:
+    """Parse *s* as int, returning ``None`` on failure."""
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def builtin_read(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
-    """Implement read builtin (basic)."""
-    line = io.stdin.readline()
+    """Implement read builtin with flag support.
+
+    Supported flags:
+      -r          Do not interpret backslash escapes
+      -a ARRAY    Read into an array variable (split on IFS)
+      -d DELIM    Use DELIM as the line delimiter instead of newline
+      -p PROMPT   Display prompt (ignored in virtual shell)
+      -n COUNT    Read at most COUNT characters
+      -t TIMEOUT  Timeout (no-op in virtual shell)
+      -s          Silent (no-op in virtual shell)
+    """
+    opts = _parse_read_opts(args)
+    line = _read_input(io, opts.delimiter, opts.max_chars)
+
     if not line:
         return CommandResult(exit_code=1)
 
-    line = line.rstrip("\n")
+    # Strip the line terminator
+    if opts.delimiter == "\n":
+        line = line.rstrip("\n")
 
-    if not args:
-        state.set_var("REPLY", line)
-    elif len(args) == 1:
-        state.set_var(args[0], line)
-    else:
-        parts = line.split(None, len(args) - 1)
-        for i, name in enumerate(args):
-            state.set_var(name, parts[i] if i < len(parts) else "")
+    # Backslash handling
+    if not opts.raw_mode:
+        line = _read_process_backslashes(line)
 
+    # Determine IFS
+    ifs = state.get_var("IFS")
+    if ifs is None:
+        ifs = " \t\n"
+
+    # Assign to variables
+    _read_assign(state, opts, line, ifs)
     return CommandResult(exit_code=0)
+
+
+def _read_input(io: IOContext, delimiter: str, max_chars: int | None) -> str:
+    """Read input from *io.stdin* respecting delimiter and char limit."""
+    if max_chars is not None:
+        return io.stdin.read(max_chars)
+    if delimiter == "\n":
+        return io.stdin.readline()
+    # Read until delimiter character
+    chars: list[str] = []
+    while True:
+        ch = io.stdin.read(1)
+        if not ch or ch == delimiter:
+            break
+        chars.append(ch)
+    return "".join(chars)
+
+
+def _read_assign(state: ShellState, opts: _ReadOpts, line: str, ifs: str) -> None:
+    """Assign the read line to the appropriate variables."""
+    if opts.array_name is not None:
+        parts = _ifs_split(line, ifs)
+        state.set_array(opts.array_name, parts)
+    elif not opts.var_names:
+        state.set_var("REPLY", line)
+    elif len(opts.var_names) == 1:
+        state.set_var(opts.var_names[0], line)
+    else:
+        parts = _ifs_split_n(line, ifs, len(opts.var_names))
+        for idx, name in enumerate(opts.var_names):
+            state.set_var(name, parts[idx] if idx < len(parts) else "")
+
+
+def _read_process_backslashes(line: str) -> str:
+    """Process backslash escapes for read (without -r).
+
+    A trailing backslash removes the newline (line continuation).
+    Other backslashes escape the next character.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(line):
+        if line[i] == "\\":
+            if i + 1 < len(line):
+                result.append(line[i + 1])
+                i += 2
+            else:
+                # Trailing backslash — remove it (line continuation)
+                i += 1
+        else:
+            result.append(line[i])
+            i += 1
+    return "".join(result)
+
+
+def _ifs_split(line: str, ifs: str) -> list[str]:
+    """Split a line on IFS characters, returning all fields.
+
+    IFS whitespace characters (space, tab, newline) are treated specially:
+    leading/trailing whitespace is trimmed, and runs of whitespace collapse.
+    Non-whitespace IFS characters delimit exactly.
+    """
+    if not ifs:
+        return [line] if line else []
+
+    ifs_white = "".join(c for c in ifs if c in " \t\n")
+    ifs_non_white = "".join(c for c in ifs if c not in " \t\n")
+
+    if not ifs_non_white:
+        return line.split()
+
+    if not ifs_white:
+        # IFS is only non-whitespace — split on those characters exactly
+        parts = [line]
+        for delim in ifs_non_white:
+            new_parts: list[str] = []
+            for part in parts:
+                new_parts.extend(part.split(delim))
+            parts = new_parts
+        return parts
+
+    # Mixed: strip IFS whitespace, then split on non-whitespace delimiters
+    stripped = line.strip(ifs_white)
+    if not stripped:
+        return []
+    parts = [stripped]
+    for delim in ifs_non_white:
+        new_parts: list[str] = []
+        for part in parts:
+            new_parts.extend(part.split(delim))
+        parts = new_parts
+    return [p.strip(ifs_white) for p in parts]
+
+
+def _ifs_split_n(line: str, ifs: str, n: int) -> list[str]:
+    """Split a line on IFS into at most *n* fields.
+
+    The last field gets the remainder of the line (unsplit).
+    """
+    if n <= 1 or not ifs:
+        return [line]
+
+    ifs_white = "".join(c for c in ifs if c in " \t\n")
+
+    parts: list[str] = []
+    remaining = line
+
+    # Strip leading IFS whitespace
+    if ifs_white:
+        remaining = remaining.lstrip(ifs_white)
+
+    for _ in range(n - 1):
+        if not remaining:
+            break
+
+        best_pos = _find_ifs_char(remaining, ifs)
+        if best_pos == -1:
+            break
+
+        parts.append(remaining[:best_pos])
+        remaining = remaining[best_pos + 1 :]
+        if ifs_white:
+            remaining = remaining.lstrip(ifs_white)
+
+    # Strip trailing IFS whitespace from the remainder for the last field
+    if ifs_white:
+        remaining = remaining.rstrip(ifs_white)
+    parts.append(remaining)
+
+    return parts
+
+
+def _find_ifs_char(s: str, ifs: str) -> int:
+    """Return the index of the first IFS character in *s*, or -1."""
+    for pos, c in enumerate(s):
+        if c in ifs:
+            return pos
+    return -1
 
 
 def builtin_shift(
@@ -340,8 +769,69 @@ def builtin_local(
 def builtin_declare(
     args: list[str], state: ShellState, vfs: VirtualFilesystem, io: IOContext
 ) -> CommandResult:
-    """Implement declare builtin (simplified)."""
-    return builtin_local(args, state, vfs, io)
+    """Implement declare builtin with -A support for associative arrays."""
+    # Detect -A flag
+    has_assoc = False
+    remaining: list[str] = []
+    for arg in args:
+        if arg == "-A":
+            has_assoc = True
+        elif arg.startswith("-"):
+            # Ignore other flags like -a, -i, -r, -x, etc.
+            pass
+        else:
+            remaining.append(arg)
+
+    if has_assoc:
+        for arg in remaining:
+            if "=" in arg:
+                name, value_part = arg.split("=", 1)
+                assoc = _parse_assoc_initializer(value_part)
+                state.set_assoc(name, assoc)
+            else:
+                state.set_assoc(arg, {})
+        return CommandResult(exit_code=0)
+
+    return builtin_local(remaining, state, vfs, io)
+
+
+def _parse_assoc_initializer(value: str) -> dict[str, str]:
+    """Parse an associative array initializer like ``([key1]=val1 [key2]=val2)``.
+
+    The value string may or may not be wrapped in parentheses.
+    """
+    result: dict[str, str] = {}
+    text = value.strip()
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+
+    # Parse [key]=value pairs
+    i = 0
+    while i < len(text):
+        # Skip whitespace
+        while i < len(text) and text[i] in (" ", "\t"):
+            i += 1
+        if i >= len(text):
+            break
+        if text[i] == "[":
+            # Find closing ]
+            j = text.index("]", i + 1)
+            key = text[i + 1 : j]
+            # Skip ]=
+            i = j + 1
+            if i < len(text) and text[i] == "=":
+                i += 1
+            # Read value until next space or [
+            val_start = i
+            while i < len(text) and text[i] not in (" ", "\t", "["):
+                i += 1
+            result[key] = text[val_start:i]
+        else:
+            # Skip non-bracket tokens
+            while i < len(text) and text[i] not in (" ", "\t"):
+                i += 1
+
+    return result
 
 
 # ---------------------------------------------------------------------------

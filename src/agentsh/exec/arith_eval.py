@@ -139,6 +139,17 @@ class ArithEvaluator:
     def _preprocess(self, expression: str) -> str:
         """Convert shell arithmetic syntax to Python-compatible syntax."""
         expr = expression
+
+        # Handle base#number notation: 10#09 → 9, 16#ff → 255, 2#1010 → 10
+        def _replace_base(m: re.Match[str]) -> str:
+            base = int(m.group(1))
+            try:
+                return str(int(m.group(2), base))
+            except (ValueError, OverflowError):
+                return "0"
+
+        expr = re.sub(r"(\d+)#(\w+)", _replace_base, expr)
+
         # Convert && to and, || to or
         expr = expr.replace("&&", " and ")
         expr = expr.replace("||", " or ")

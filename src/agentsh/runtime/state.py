@@ -29,17 +29,21 @@ class Scope:
     exists in an ancestor (matching Bash's dynamic-scope semantics).
     """
 
-    __slots__ = ("array_bindings", "bindings", "parent")
+    __slots__ = ("array_bindings", "assoc_bindings", "bindings", "parent")
 
     def __init__(
         self,
         parent: Scope | None = None,
         bindings: dict[str, str] | None = None,
         array_bindings: dict[str, list[str]] | None = None,
+        assoc_bindings: dict[str, dict[str, str]] | None = None,
     ) -> None:
         self.bindings: dict[str, str] = bindings if bindings is not None else {}
         self.array_bindings: dict[str, list[str]] = (
             array_bindings if array_bindings is not None else {}
+        )
+        self.assoc_bindings: dict[str, dict[str, str]] = (
+            assoc_bindings if assoc_bindings is not None else {}
         )
         self.parent = parent
 
@@ -133,6 +137,54 @@ class Scope:
             result.update(frame.array_bindings)
         return result
 
+    # -- associative array operations -----------------------------------------
+
+    def get_assoc(self, name: str) -> dict[str, str] | None:
+        """Walk the scope chain looking for associative array *name*."""
+        scope: Scope | None = self
+        while scope is not None:
+            if name in scope.assoc_bindings:
+                return scope.assoc_bindings[name]
+            scope = scope.parent
+        return None
+
+    def set_assoc(self, name: str, values: dict[str, str]) -> None:
+        """Set assoc array *name* in the nearest owning scope, or *self*."""
+        scope: Scope | None = self
+        while scope is not None:
+            if name in scope.assoc_bindings:
+                scope.assoc_bindings[name] = values
+                return
+            scope = scope.parent
+        self.assoc_bindings[name] = values
+
+    def get_assoc_element(self, name: str, key: str) -> str | None:
+        """Get a single element from associative array *name*."""
+        assoc = self.get_assoc(name)
+        if assoc is not None:
+            return assoc.get(key)
+        return None
+
+    def set_assoc_element(self, name: str, key: str, value: str) -> None:
+        """Set a single element of associative array *name*."""
+        assoc = self.get_assoc(name)
+        if assoc is None:
+            assoc = {}
+            self.assoc_bindings[name] = assoc
+        assoc[key] = value
+
+    def flatten_assoc(self) -> dict[str, dict[str, str]]:
+        """Collapse the chain into a single dict of associative arrays."""
+        result: dict[str, dict[str, str]] = {}
+        frames: list[Scope] = []
+        scope: Scope | None = self
+        while scope is not None:
+            frames.append(scope)
+            scope = scope.parent
+        for frame in reversed(frames):
+            result.update(frame.assoc_bindings)
+        return result
+
     # -- child scope ----------------------------------------------------------
 
     def push(self, bindings: dict[str, str] | None = None) -> Scope:
@@ -159,6 +211,7 @@ class Scope:
             parent=None,
             bindings=dict(self.flatten()),
             array_bindings={k: list(v) for k, v in self.flatten_arrays().items()},
+            assoc_bindings={k: dict(v) for k, v in self.flatten_assoc().items()},
         )
 
 
@@ -226,6 +279,24 @@ class ShellState:
     def set_array_element(self, name: str, index: int, value: str) -> None:
         """Set a single element of an array."""
         self.scope.set_array_element(name, index, value)
+
+    # -- associative array access (delegates to scope chain) ------------------
+
+    def get_assoc(self, name: str) -> dict[str, str] | None:
+        """Look up associative array variable in scope chain."""
+        return self.scope.get_assoc(name)
+
+    def set_assoc(self, name: str, values: dict[str, str]) -> None:
+        """Set an associative array variable."""
+        self.scope.set_assoc(name, values)
+
+    def get_assoc_element(self, name: str, key: str) -> str | None:
+        """Get a single element from an associative array."""
+        return self.scope.get_assoc_element(name, key)
+
+    def set_assoc_element(self, name: str, key: str, value: str) -> None:
+        """Set a single element of an associative array."""
+        self.scope.set_assoc_element(name, key, value)
 
     # -- scope management -----------------------------------------------------
 

@@ -37,6 +37,7 @@ from agentsh.ast.spans import Point, Span
 from agentsh.ast.words import (
     ArithmeticExpansionSegment,
     CommandSubstitutionSegment,
+    DoubleQuotedSegment,
     GlobSegment,
     LiteralSegment,
     ParameterExpansionSegment,
@@ -288,6 +289,185 @@ def _normalize_assignment(
     return AssignmentWord(name=name, value=value, span=_span(node))
 
 
+def _parse_heredoc_body(text: str) -> list[WordSegment]:
+    """Parse heredoc body text to extract expansion segments.
+
+    Scans character-by-character to find:
+    - ``$((expr))`` -> ArithmeticExpansionSegment
+    - ``$(cmd)``    -> CommandSubstitutionSegment
+    - ``${var}``    -> ParameterExpansionSegment
+    - ``$name``     -> ParameterExpansionSegment
+    - Everything else -> LiteralSegment
+    """
+    segments: list[WordSegment] = []
+    i = 0
+    n = len(text)
+    literal_start = 0
+
+    while i < n:
+        if text[i] == "$" and i + 1 < n:
+            if i > literal_start:
+                segments.append(LiteralSegment(value=text[literal_start:i]))
+            seg, new_i = _scan_dollar(text, i, n)
+            segments.append(seg)
+            i = new_i
+            literal_start = i
+        else:
+            i += 1
+
+    if literal_start < n:
+        segments.append(LiteralSegment(value=text[literal_start:]))
+
+    return segments
+
+
+def _scan_dollar(text: str, i: int, n: int) -> tuple[WordSegment, int]:
+    """Parse a single ``$``-initiated expansion starting at index *i*.
+
+    Returns ``(segment, new_index)`` where *new_index* is the position
+    immediately after the consumed expansion.
+    """
+    next_ch = text[i + 1]
+
+    # $((...)) — arithmetic expansion
+    if next_ch == "(" and i + 2 < n and text[i + 2] == "(":
+        seg, end = _scan_arith_expansion(text, i, n)
+        if seg is not None:
+            return seg, end
+
+    # $(...) — command substitution
+    if next_ch == "(":
+        seg, end = _scan_command_sub(text, i, n)
+        if seg is not None:
+            return seg, end
+
+    # ${...} — braced parameter expansion
+    if next_ch == "{":
+        j = text.find("}", i + 2)
+        if j >= 0:
+            inner = text[i + 2 : j]
+            return _parse_braced_param(inner), j + 1
+
+    # $name — simple variable
+    if next_ch == "_" or next_ch.isalpha():
+        j = i + 2
+        while j < n and (text[j].isalnum() or text[j] == "_"):
+            j += 1
+        return ParameterExpansionSegment(name=text[i + 1 : j]), j
+
+    # $digit — positional parameter
+    if next_ch.isdigit():
+        return ParameterExpansionSegment(name=next_ch), i + 2
+
+    # $? $# $@ $* $! $$ $- — special parameters
+    if next_ch in "?#@*!$-":
+        return ParameterExpansionSegment(name=next_ch), i + 2
+
+    # Lone $ — literal
+    return LiteralSegment(value="$"), i + 1
+
+
+def _scan_arith_expansion(
+    text: str, i: int, n: int
+) -> tuple[ArithmeticExpansionSegment | None, int]:
+    """Try to scan ``$((...))`` at *i*.
+
+    Returns ``(seg, end)`` or ``(None, 0)``.
+    """
+    depth = 1
+    j = i + 3
+    while j < n - 1 and depth > 0:
+        if text[j] == "(" and text[j + 1] == "(":
+            depth += 1
+            j += 2
+        elif text[j] == ")" and text[j + 1] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+            j += 2
+        else:
+            j += 1
+    if depth == 0:
+        return ArithmeticExpansionSegment(expression=text[i + 3 : j]), j + 2
+    return None, 0
+
+
+def _scan_command_sub(
+    text: str, i: int, n: int
+) -> tuple[CommandSubstitutionSegment | None, int]:
+    """Try to scan ``$(...)`` at *i*.
+
+    Returns ``(seg, end)`` or ``(None, 0)``.
+    """
+    depth = 1
+    j = i + 2
+    while j < n and depth > 0:
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+        j += 1
+    if depth == 0:
+        return CommandSubstitutionSegment(command=text[i + 2 : j - 1]), j
+    return None, 0
+
+
+def _parse_braced_param(inner: str) -> ParameterExpansionSegment:
+    """Parse the content inside ``${...}`` into a ParameterExpansionSegment."""
+    # ${#var} — string length
+    if inner.startswith("#") and not inner.startswith("##"):
+        rest = inner[1:]
+        if "[" in rest:
+            arr_name = rest[: rest.index("[")]
+            return ParameterExpansionSegment(
+                name=arr_name, operator="#[", argument=None
+            )
+        return ParameterExpansionSegment(name=rest, operator="#len", argument=None)
+
+    # ${arr[idx]}
+    if "[" in inner:
+        bracket_start = inner.index("[")
+        name = inner[:bracket_start]
+        rest = inner[bracket_start:]
+        bracket_end = rest.find("]")
+        if bracket_end >= 0:
+            subscript = rest[1:bracket_end]
+            after = rest[bracket_end + 1 :]
+            if not after:
+                return ParameterExpansionSegment(
+                    name=name, operator="[", argument=subscript
+                )
+
+    # Check for operators
+    for op in (
+        ":-",
+        ":+",
+        ":=",
+        ":?",
+        "-",
+        "+",
+        "=",
+        "?",
+        "//",
+        "/",
+        "##",
+        "#",
+        "%%",
+        "%",
+        "^^",
+        "^",
+        ",,",
+        ",",
+    ):
+        idx = inner.find(op)
+        if idx > 0:
+            name = inner[:idx]
+            argument = inner[idx + len(op) :]
+            return ParameterExpansionSegment(name=name, operator=op, argument=argument)
+
+    return ParameterExpansionSegment(name=inner)
+
+
 def _normalize_redirection(  # noqa: C901
     node: Node, source: str, diagnostics: list[Diagnostic]
 ) -> Redirection:
@@ -324,15 +504,21 @@ def _normalize_redirection(  # noqa: C901
                 elif text == "<<":
                     op = "<<"
 
-        # Find the heredoc body node
+        # Find the heredoc body node and delimiter
         body_node = None
         delimiter_node = None
         for child in node.children:
             if child.type == "heredoc_body":
                 body_node = child
-            elif child.is_named and child.type not in (
-                "heredoc_body",
-                "file_descriptor",
+            elif child.type == "heredoc_start" or (
+                delimiter_node is None
+                and child.is_named
+                and child.type
+                not in (
+                    "heredoc_body",
+                    "heredoc_end",
+                    "file_descriptor",
+                )
             ):
                 delimiter_node = child
 
@@ -363,9 +549,18 @@ def _normalize_redirection(  # noqa: C901
                 segments=(SingleQuotedSegment(value=body_text),), span=_span(node)
             )
         else:
-            target_word = Word(
-                segments=(LiteralSegment(value=body_text),), span=_span(node)
-            )
+            # Unquoted delimiter: expand variables in the body
+            parsed_segments = _parse_heredoc_body(body_text)
+            if parsed_segments:
+                target_word = Word(
+                    segments=(DoubleQuotedSegment(segments=tuple(parsed_segments)),),
+                    span=_span(node),
+                )
+            else:
+                target_word = Word(
+                    segments=(DoubleQuotedSegment(segments=()),),
+                    span=_span(node),
+                )
         return Redirection(op=op, fd=fd, target=target_word, span=_span(node))
 
     # --- normal file redirections ---
@@ -620,18 +815,33 @@ def _normalize_declaration_command(
                 )
             continue
         if child.type == "variable_assignment":
-            # Convert to a word arg like "FOO=bar" for the builtin
+            # Convert to a word arg like "FOO=bar" for the builtin.
+            # Array initializers (name=(...)) use SingleQuotedSegment to
+            # prevent word splitting on spaces inside the parentheses.
             name_node = child.child_by_field_name("name")
-            value_node = child.child_by_field_name("value")
             name = _node_text(name_node, source) if name_node else ""
-            if value_node:
-                value_text = _node_text(value_node, source)
-                words.append(
-                    Word(
-                        segments=(LiteralSegment(value=f"{name}={value_text}"),),
-                        span=_span(child),
+            has_array = any(c.type == "array" for c in child.children)
+            value_node = child.child_by_field_name("value")
+            if has_array or value_node:
+                value_text = _node_text(child, source)
+                # Remove leading "name=" prefix — we already have it
+                eq_idx = value_text.find("=")
+                val_part = value_text[eq_idx + 1 :] if eq_idx >= 0 else ""
+                if has_array:
+                    # Prevent word splitting on array init values
+                    words.append(
+                        Word(
+                            segments=(SingleQuotedSegment(value=f"{name}={val_part}"),),
+                            span=_span(child),
+                        )
                     )
-                )
+                else:
+                    words.append(
+                        Word(
+                            segments=(LiteralSegment(value=f"{name}={val_part}"),),
+                            span=_span(child),
+                        )
+                    )
             else:
                 words.append(
                     Word(
@@ -639,6 +849,14 @@ def _normalize_declaration_command(
                         span=_span(child),
                     )
                 )
+        elif child.type == "variable_name":
+            # Bare variable name (e.g. ``declare -A name``)
+            words.append(
+                Word(
+                    segments=(LiteralSegment(value=_node_text(child, source)),),
+                    span=_span(child),
+                )
+            )
         elif child.type in ("word", "string", "raw_string", "simple_expansion"):
             words.append(_normalize_word_node(child, source))
 
@@ -864,8 +1082,6 @@ def _extract_double_quoted(node: Node, source: str) -> list[WordSegment]:
         else:
             inner_segments.extend(_extract_segments(child, source))
 
-    from agentsh.ast.words import DoubleQuotedSegment
-
     # Always create a DoubleQuotedSegment, even for empty strings like ""
     segments.append(DoubleQuotedSegment(segments=tuple(inner_segments)))
 
@@ -889,110 +1105,126 @@ def _parse_expansion(node: Node, source: str) -> ParameterExpansionSegment:
 
     # ${#var} — string length operator
     if inner.startswith("#") and not inner.startswith("##"):
-        rest = inner[1:]
-        # ${#arr[@]} or ${#arr[*]} — array length
-        if "[" in rest:
-            arr_name = rest[: rest.index("[")]
-            return ParameterExpansionSegment(
-                name=arr_name, operator="#[", argument=None
-            )
-        return ParameterExpansionSegment(name=rest, operator="#len", argument=None)
+        return _parse_length_expansion(inner[1:])
+
+    # ${!name[@]} / ${!name[*]} — array keys expansion
+    if inner.startswith("!") and "[" in inner:
+        result = _parse_indirect_expansion(inner)
+        if result is not None:
+            return result
 
     # ${arr[idx]} — array subscript (possibly with further operator)
     if "[" in inner:
-        bracket_start = inner.index("[")
-        name = inner[:bracket_start]
-        rest = inner[bracket_start:]
-        # Find the closing ]
-        bracket_end = rest.find("]")
-        if bracket_end >= 0:
-            subscript = rest[1:bracket_end]
-            after = rest[bracket_end + 1 :]
-            if not after:
-                # Plain ${arr[idx]}
-                return ParameterExpansionSegment(
-                    name=name, operator="[", argument=subscript
-                )
-            # ${arr[idx]op...} e.g. ${arr[0]:-default}
-            for op in (
-                ":-",
-                ":+",
-                ":=",
-                ":?",
-                "-",
-                "+",
-                "=",
-                "?",
-                "//",
-                "/",
-                "##",
-                "#",
-                "%%",
-                "%",
-                "^^",
-                "^",
-                ",,",
-                ",",
-                ":",
-            ):
-                if after.startswith(op):
-                    arg = after[len(op) :]
-                    return ParameterExpansionSegment(
-                        name=name,
-                        operator=f"[{subscript}]{op}",
-                        argument=arg,
-                    )
+        return _parse_subscript_expansion(inner)
+
+    # ${var:offset:length} — substring extraction
+    result = _parse_substring_expansion(inner)
+    if result is not None:
+        return result
+
+    # Check for operators
+    return _find_operator(inner)
+
+
+def _parse_length_expansion(rest: str) -> ParameterExpansionSegment:
+    """Parse ``${#var}`` or ``${#arr[@]}``."""
+    if "[" in rest:
+        arr_name = rest[: rest.index("[")]
+        return ParameterExpansionSegment(name=arr_name, operator="#[", argument=None)
+    return ParameterExpansionSegment(name=rest, operator="#len", argument=None)
+
+
+def _parse_indirect_expansion(inner: str) -> ParameterExpansionSegment | None:
+    """Parse ``${!name[@]}`` / ``${!name[*]}``."""
+    bracket_start = inner.index("[")
+    arr_name = inner[1:bracket_start]
+    bracket_rest = inner[bracket_start:]
+    bracket_end = bracket_rest.find("]")
+    if bracket_end >= 0:
+        subscript = bracket_rest[1:bracket_end]
+        if subscript in ("@", "*"):
+            return ParameterExpansionSegment(
+                name=arr_name, operator="![@]", argument=None
+            )
+    return None
+
+
+def _parse_subscript_expansion(inner: str) -> ParameterExpansionSegment:
+    """Parse ``${arr[idx]}`` and ``${arr[idx]op...}``."""
+    bracket_start = inner.index("[")
+    name = inner[:bracket_start]
+    rest = inner[bracket_start:]
+    bracket_end = rest.find("]")
+    if bracket_end >= 0:
+        subscript = rest[1:bracket_end]
+        after = rest[bracket_end + 1 :]
+        if not after:
             return ParameterExpansionSegment(
                 name=name, operator="[", argument=subscript
             )
+        # ${arr[idx]op...} e.g. ${arr[0]:-default}
+        for op in (*_PARAM_OPERATORS, ":"):
+            if after.startswith(op):
+                arg = after[len(op) :]
+                return ParameterExpansionSegment(
+                    name=name,
+                    operator=f"[{subscript}]{op}",
+                    argument=arg,
+                )
+        return ParameterExpansionSegment(name=name, operator="[", argument=subscript)
+    return ParameterExpansionSegment(name=inner)
 
-    # ${var:offset:length} — substring extraction
-    # Must check before the regular operator scan to avoid confusion with :- etc.
+
+def _parse_substring_expansion(
+    inner: str,
+) -> ParameterExpansionSegment | None:
+    """Parse ``${var:offset:length}``."""
     colon_idx = inner.find(":")
     if colon_idx > 0:
         after_colon = inner[colon_idx + 1 :]
-        # Substring if what follows the colon looks numeric (possibly negative)
         if (
             after_colon
-            and (
-                after_colon[0].isdigit()
-                or after_colon[0] == "-"
-                or after_colon[0] == " "
-            )
+            and after_colon[0] in "0123456789- "
             and not after_colon.startswith(("-", "+", "=", "?"))
         ):
             name = inner[:colon_idx]
             return ParameterExpansionSegment(
                 name=name, operator=":", argument=after_colon
             )
+    return None
 
-    # Check for operators: :-, :+, :=, :?, -, +, =, ?, //, /, ##, #, %%, %, ^^, ^, ,,, ,
-    for op in (
-        ":-",
-        ":+",
-        ":=",
-        ":?",
-        "-",
-        "+",
-        "=",
-        "?",
-        "//",
-        "/",
-        "##",
-        "#",
-        "%%",
-        "%",
-        "^^",
-        "^",
-        ",,",
-        ",",
-    ):
+
+#: Operator strings checked in priority order for parameter expansions.
+_PARAM_OPERATORS: tuple[str, ...] = (
+    ":-",
+    ":+",
+    ":=",
+    ":?",
+    "-",
+    "+",
+    "=",
+    "?",
+    "//",
+    "/",
+    "##",
+    "#",
+    "%%",
+    "%",
+    "^^",
+    "^",
+    ",,",
+    ",",
+)
+
+
+def _find_operator(inner: str) -> ParameterExpansionSegment:
+    """Scan *inner* for a known parameter expansion operator."""
+    for op in _PARAM_OPERATORS:
         idx = inner.find(op)
         if idx > 0:
             name = inner[:idx]
             argument = inner[idx + len(op) :]
             return ParameterExpansionSegment(name=name, operator=op, argument=argument)
-
     return ParameterExpansionSegment(name=inner)
 
 
