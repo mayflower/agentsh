@@ -20,9 +20,9 @@ print(result.stdout)    # Hello\n
 print(result.exit_code) # 0
 ```
 
-**146 commands** including coreutils, text processing, archives, and 35 shell builtins. Filesystem is shared across calls. State persists. Everything runs in-memory.
+**166 commands** including coreutils, text processing, archives, structured data (jq, yq, patch), modern search (rg, fd), and 40 shell builtins. Filesystem is shared across calls. State persists. Everything runs in-memory.
 
-Built for AI agents that need to execute bash scripts safely — in tool-use loops, sandboxes, and planning pipelines.
+Built for AI agents that need to execute bash scripts safely -- in tool-use loops, sandboxes, and planning pipelines. Validated against 20 real-world production scripts (log analysis, config templating, build systems, linters, migration planners).
 
 ## Install
 
@@ -171,33 +171,37 @@ if result.exit_code != 0:
 
 ## Command Support
 
-### Shell Builtins (35)
+### Shell Builtins (40)
 
-`[` `alias` `bg` `cd` `declare` `echo` `eval` `exec` `exit` `export` `false` `fg` `getopts` `hash` `help` `jobs` `let` `local` `printf` `pwd` `read` `readonly` `return` `set` `shift` `test` `times` `trap` `true` `type` `ulimit` `umask` `unalias` `unset` `wait`
+`[` `[[` `alias` `bg` `break` `cd` `continue` `declare` `echo` `eval` `exec` `exit` `export` `false` `fg` `getopts` `hash` `help` `jobs` `let` `local` `printf` `pwd` `read` `readonly` `return` `set` `shift` `source` `.` `test` `times` `trap` `true` `type` `ulimit` `umask` `unalias` `unset` `wait`
 
-### File Operations (19)
+### Search (5)
 
-`cat` `cp` `dd` `head` `link` `ln` `ls` `mkdir` `mkfifo` `mktemp` `mv` `rm` `rmdir` `shred` `stat` `tail` `tee` `touch` `tree`
+`fd` `find` `grep` `rg` `xargs`
 
-### Text Processing (27)
+### Structured Data (3)
 
-`awk` `cmp` `comm` `cut` `diff` `egrep` `expand` `factor` `fgrep` `fold` `grep` `hd` `head` `nl` `od` `paste` `rev` `sed` `sort` `split` `strings` `tail` `tr` `tsort` `uniq` `wc` `xxd`
+`jq` `patch` `yq`
 
-### Search & Transform
+### File Operations (21)
 
-`find` `xargs`
+`cat` `cp` `dd` `file` `head` `install` `link` `ln` `ls` `mkdir` `mkfifo` `mktemp` `mv` `rm` `rmdir` `shred` `stat` `tail` `tee` `touch` `tree`
 
-### Archive & Compression (11)
+### Text Processing (31)
 
-`ar` `bunzip2` `bzcat` `bzip2` `cpio` `gunzip` `gzip` `lzcat` `tar` `unzip` `zcat`
+`awk` `cmp` `column` `comm` `cut` `diff` `egrep` `envsubst` `expand` `factor` `fgrep` `fmt` `fold` `hd` `nl` `od` `paste` `rev` `sed` `sort` `split` `strings` `tac` `tr` `tsort` `uniq` `wc` `xxd`
 
-### Encoding & Checksums (6)
+### Archive & Compression (12)
 
-`base64` `cksum` `hexdump` `md5sum` `sha256sum` `xxd`
+`ar` `bunzip2` `bzcat` `bzip2` `cpio` `gunzip` `gzip` `lzcat` `tar` `unzip` `zcat` `zip`
 
-### Math (4)
+### Encoding & Checksums (7)
 
-`bc` `expr` `factor` `seq`
+`base64` `cksum` `hexdump` `md5sum` `sha1sum` `sha256sum` `xxd`
+
+### Math & Data (6)
+
+`bc` `expr` `factor` `seq` `shuf` `uuidgen`
 
 ### System Info & Utilities (30)
 
@@ -213,13 +217,16 @@ Commands accepted for compatibility but with no real effect in the virtual envir
 
 Full bash syntax parsing via tree-sitter:
 
-- **Variables**: `$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR##pattern}`, `$?`, `$#`, `$@`
-- **Quoting**: single quotes, double quotes, `$"..."`, backslash escapes
-- **Expansion**: tilde, parameter, command substitution `$(...)`, arithmetic `$(( ))`
-- **Control flow**: `if`/`elif`/`else`/`fi`, `while`, `until`, `for`, `case`/`esac`
+- **Variables**: `$VAR`, `${VAR}`, `${VAR:-default}`, `${VAR##pattern}`, `${#VAR}`, `${VAR:0:3}`, `${VAR/pat/repl}`, `${VAR^^}`, `${VAR,,}`, `$?`, `$#`, `$@`
+- **Arrays**: indexed `arr=(a b c)`, `${arr[0]}`, `${arr[@]}`, `${#arr[@]}` and associative `declare -A`, `${!arr[@]}`
+- **Quoting**: single quotes, double quotes, backslash escapes
+- **Expansion**: tilde, parameter, command substitution `$(...)`, arithmetic `$(( ))`, process substitution `<(cmd)`
+- **Control flow**: `if`/`elif`/`else`/`fi`, `while`, `until`, `for`, `for (( ))`, `case`/`esac`, `break`, `continue`
+- **Tests**: `[ ... ]` POSIX test, `[[ ... ]]` extended test with glob `==`, regex `=~`, `&&`/`||`
 - **Operators**: `&&`, `||`, `;`, `|` (pipelines)
-- **Redirections**: `>`, `>>`, `<`, `2>`, `2>&1`
-- **Functions**: definition, local variables, return values, recursion
+- **Redirections**: `>`, `>>`, `<`, `2>`, `2>&1`, `<<` (here-doc), `<<<` (here-string)
+- **Arithmetic**: `+`, `-`, `*`, `/`, `%`, `**`, `<`, `>`, `==`, `!=`, `&&`, `||`, `!`, `?:` (ternary), bitwise, `++`/`--`
+- **Functions**: definition, local variables, positional params, return values, recursion
 - **Subshells**: `( ... )` with isolated state, shared filesystem
 - **Groups**: `{ ...; }` in current shell context
 
@@ -251,7 +258,7 @@ Full bash syntax parsing via tree-sitter:
                     │              │        │          │
                ┌────▼───┐  ┌──────▼──┐  ┌──▼───┐  ┌──▼────┐
                │Builtins│  │Commands │  │ VFS  │  │Policy │
-               │  (35)  │  │  (111)  │  │in-mem│  │engine │
+               │  (40)  │  │  (126)  │  │in-mem│  │engine │
                └────────┘  └─────────┘  └──────┘  └───────┘
 ```
 
@@ -365,7 +372,7 @@ This makes it safe for AI agent tool-use loops where the agent generates and exe
 
 ```bash
 uv sync                          # Install dependencies
-uv run pytest tests/ -q          # Run 1500+ tests
+uv run pytest tests/ -q          # Run 2100+ tests
 uv run ruff check .              # Lint
 uv run ruff format .             # Format
 uv run pyright                   # Type check (strict)
